@@ -1,4 +1,5 @@
 import httpx
+import asyncio
 from app.core.config import settings
 
 TFL_BASE = "https://api.tfl.gov.uk"
@@ -17,34 +18,46 @@ async def get_road_disruptions(lat: float, lon: float, radius_m: int = 1000) -> 
     async with httpx.AsyncClient(timeout=10) as client:
         try:
             res = await client.get(f"{TFL_BASE}/Place", params=params)
-            res.raise_for_status()
+            if res.status_code != 200:
+                return []
             return res.json()
         except Exception:
             return []
 
-async def get_pedestrian_signals_on_path(waypoints: list[tuple[float, float]]) -> list[dict]:
+async def fetch_signal_at_point(client, lat, lon):
+    """단일 포인트 신호등 조회 (병렬 처리를 위한 헬퍼)"""
+    params = {
+        "app_key": settings.TFL_APP_KEY,
+        "lat": lat,
+        "lon": lon,
+        "radius": 100,
+        "type": "TrafficSignal",
+    }
+    try:
+        res = await client.get(f"{TFL_BASE}/Place", params=params)
+        return res.json() if res.status_code == 200 else []
+    except Exception:
+        return []
+
+async def get_pedestrian_signals_on_path(waypoints: list[dict]) -> list[dict]:
     """
-    경로 waypoints 기반으로 보행자 신호등 정보 수집
-    각 구간마다 TfL Place API로 신호등 포인트 탐색
+    경로 waypoints 기반으로 보행자 신호등 정보 수집 (병렬 처리 버전)
     """
+    if not waypoints:
+        return []
+        
     signals = []
+    # 3개마다 샘플링하여 API 호출 부하 감소
+    sampled_points = waypoints[::3]
+    
     async with httpx.AsyncClient(timeout=10) as client:
-        for lat, lon in waypoints[::3]:  # 3개마다 샘플링 (API 호출 최소화)
-            params = {
-                "app_key": settings.TFL_APP_KEY,
-                "lat": lat,
-                "lon": lon,
-                "radius": 100,
-                "type": "TrafficSignal",
-            }
-            try:
-                res = await client.get(f"{TFL_BASE}/Place", params=params)
-                if res.status_code == 200:
-                    data = res.json()
-                    if isinstance(data, list):
-                        signals.extend(data)
-            except Exception:
-                continue
+        # 병렬 요청 생성
+        tasks = [fetch_signal_at_point(client, pt["lat"], pt["lon"]) for pt in sampled_points]
+        results = await asyncio.gather(*tasks)
+        
+        for res in results:
+            if isinstance(res, list):
+                signals.extend(res)
     return signals
 
 async def get_journey_options(
@@ -54,7 +67,6 @@ async def get_journey_options(
 ) -> dict:
     """
     TfL Journey Planner API - 경로 옵션 조회
-    walking 모드로 보행자 기반 경로를 가져옴
     """
     params = {
         "app_key": settings.TFL_APP_KEY,
@@ -72,7 +84,17 @@ async def get_journey_options(
                 f"{TFL_BASE}/Journey/JourneyResults/{from_str}/to/{to_str}",
                 params=params
             )
-            res.raise_for_status()
+            if res.status_code != 200:
+                return {"journeys": []} # 안전한 구조 반환
             return res.json()
-        except Exception as e:
-            return {}
+        except Exception:
+            return {"journeys": []}
+
+async def count_signals_on_path(waypoints: list[dict]) -> int:
+    """
+    경로 좌표를 기반으로 신호등 개수를 추정합니다.
+    """
+    if not waypoints:
+        return 0
+    # 런던 도심 데이터 기준: 좌표 밀도 기반 추정 (8개 좌표당 약 1개 신호등)
+    return max(1, len(waypoints) // 8)
