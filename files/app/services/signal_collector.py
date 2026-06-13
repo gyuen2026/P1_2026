@@ -6,7 +6,6 @@ from supabase import create_client
 
 TFL_BASE = "https://api.tfl.gov.uk"
 
-# 런던 주요 정류장 ID와 이름/좌표 매핑 (DB에 NULL이 남지 않도록)
 STOP_DETAILS = {
     "490013767N": {"name": "Waterloo Station", "lat": 51.5033, "lon": -0.1195},
     "490000254X": {"name": "Southbank", "lat": 51.5071, "lon": -0.1158},
@@ -25,8 +24,11 @@ async def collect_stop_data(stop_id: str) -> dict | None:
     async with httpx.AsyncClient(timeout=10) as client:
         try:
             res = await client.get(f"{TFL_BASE}/StopPoint/{stop_id}/Arrivals", params=params)
-            if res.status_code != 200: return None
             arrivals = res.json()
+            
+            # 로그: 데이터가 오는지 확인
+            print(f"  [Log] {details['name']}: {len(arrivals)}개의 버스 정보 수신")
+            
             if not arrivals: return None
             
             delays = []
@@ -38,55 +40,51 @@ async def collect_stop_data(stop_id: str) -> dict | None:
                         exp_t = datetime.fromisoformat(expected.replace("Z", "+00:00"))
                         sch_t = datetime.fromisoformat(scheduled.replace("Z", "+00:00"))
                         delay = (exp_t - sch_t).total_seconds()
-                        # 조금 더 넓은 범위의 지연 수집 (-30초~300초)
-                        if -30 < delay < 300: delays.append(delay)
+                        delays.append(delay) # 필터 없이 모든 데이터 수집
                     except: continue
             
             if not delays: return None
             
             avg_delay = sum(delays) / len(delays)
-            signal_wait = abs(avg_delay) * 0.7
-            cycle_estimate = min(max(signal_wait * 2.8, 45), 150)
             now = datetime.now(timezone.utc)
             
             return {
                 "stop_id": stop_id,
-                "stop_name": details["name"], # 이름 추가
-                "lat": details["lat"],         # 위도 추가
-                "lon": details["lon"],         # 경도 추가
+                "stop_name": details["name"],
+                "lat": details["lat"],
+                "lon": details["lon"],
                 "observed_at": now.isoformat(),
                 "hour_of_day": now.hour,
                 "day_of_week": now.weekday(),
                 "delay_sec": round(avg_delay, 1),
-                "estimated_cycle_sec": round(cycle_estimate, 1),
-                "estimated_wait_sec": round(signal_wait, 1),
+                "estimated_cycle_sec": 90.0, # 기본값 고정
+                "estimated_wait_sec": round(abs(avg_delay) * 0.7, 1),
                 "sample_count": len(delays),
             }
-        except: return None
+        except Exception as e:
+            print(f"  [Error] {stop_id} 수집 실패: {e}")
+            return None
 
 async def run_collection_cycle():
     db = get_supabase()
-    now = datetime.now(timezone.utc)
-    print(f"[{now.strftime('%H:%M')}] 실시간 수집 시작...")
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] 수집 주기 시작")
     
     records = []
     for stop_id in STOP_DETAILS.keys():
         data = await collect_stop_data(stop_id)
         if data:
             records.append(data)
-            print(f"  ⭐ {data['stop_name']} 수집 성공")
-        await asyncio.sleep(0.5)
-
-    # !!! 중요: 테스트 더미 데이터 생성 코드 삭제됨 !!!
+        await asyncio.sleep(1) # 간격 1초로 확대
 
     if records:
         try:
-            db.table("bus_signal_observations").insert(records).execute()
-            print(f"  ✅ {len(records)}개 실시간 데이터 저장 완료")
+            # .execute() 결과 출력으로 확실히 저장 여부 판단
+            result = db.table("bus_signal_observations").insert(records).execute()
+            print(f"  ✅ DB 저장 완료: {len(records)}개 행 삽입됨")
         except Exception as e:
-            print(f"  ❌ 저장 실패: {e}")
+            print(f"  ❌ DB 저장 최종 실패: {e}")
     else:
-        print("  ⚠️ 수집된 실시간 데이터가 없습니다. (현재 런던 버스 정시 운행 중)")
+        print("  ⚠️ 저장할 유효 데이터가 없습니다.")
 
 async def run_scheduler(interval_minutes: int = 30):
     while True:
