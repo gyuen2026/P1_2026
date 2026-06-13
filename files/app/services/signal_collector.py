@@ -8,7 +8,7 @@ def get_supabase():
     return create_client(settings.SUPABASE_URL, settings.SUPABASE_KEY)
 
 async def process_and_save_stop(stop, db):
-    """정류장 정보를 가져와 즉시 DB에 저장하고 로그를 남김"""
+    """정류장별 데이터 수집 및 즉시 저장"""
     stop_id = stop.get("id")
     try:
         arrivals = await tfl_service.get_bus_arrivals(stop_id)
@@ -34,34 +34,41 @@ async def process_and_save_stop(stop, db):
                 "predicted_color": "RED" if avg_delay > 20 else "GREEN",
                 "observed_at": datetime.now(timezone.utc).isoformat()
             }
-            # 즉시 저장
+            # 즉시 저장 시도
             db.table("bus_signal_observations").insert(record).execute()
-            print(f"  [Row 삽입] {stop.get('commonName')} (지연: {round(avg_delay, 1)}초)")
+            print(f"  [DB 성공] {stop.get('commonName')}")
     except Exception as e:
-        # 에러 발생 시 로그만 찍고 다음 정류장으로 진행
-        print(f"  [Row 실패] {stop_id}: {e}")
+        print(f"  [DB 실패] {stop_id}: {str(e)[:50]}")
 
 async def run_global_collection():
     db = get_supabase()
-    print(f"🌍 [{datetime.now().strftime('%H:%M:%S')}] 1-3존 광역 수집 프로세스 가동...")
+    print(f"🚀 [{datetime.now().strftime('%H:%M:%S')}] 수집 엔진 가동 (Zone 1 집중)")
     
-    stops_data = await tfl_service.get_all_stops_in_zones()
-    stops = stops_data.get("stopPoints", []) if stops_data else []
-    print(f"🔎 총 {len(stops)}개의 정류장을 찾았습니다. 순차적으로 저장 시작...")
+    # 1. 연결 테스트용 데이터 무조건 한 개 삽입
+    try:
+        db.table("bus_signal_observations").insert({
+            "stop_id": "STSTEM_CHECK", "stop_name": "Server Heartbeat",
+            "lat": 51.5, "lon": -0.1, "delay_sec": 0, "predicted_color": "GREEN",
+            "observed_at": datetime.now(timezone.utc).isoformat()
+        }).execute()
+        print("✅ [DB 연결 확인] 테스트 데이터 삽입 완료!")
+    except Exception as e:
+        print(f"❌ [DB 연결 오류] Supabase가 거부함: {e}")
 
-    # API 과부하를 막기 위해 10개씩 조심스럽게 처리
-    chunk_size = 10
-    for i in range(0, len(stops), chunk_size):
-        chunk = stops[i:i+chunk_size]
+    # 2. 수집 범위를 2km(Zone 1)로 좁혀서 안정성 확보
+    stops_data = await tfl_service.get_all_stops_in_zones(radius=2000)
+    stops = stops_data.get("stopPoints", []) if stops_data else []
+    print(f"🔎 중심부 정류장 {len(stops)}개 발견. 저장 시작...")
+
+    for i in range(0, len(stops), 5): # 5개씩 천천히 처리
+        chunk = stops[i:i+5]
         await asyncio.gather(*[process_and_save_stop(s, db) for s in chunk])
-        # 1초당 10개씩 저장 (TfL과 Supabase 부하 분산)
-        await asyncio.sleep(1.0) 
+        await asyncio.sleep(1.5) 
 
 async def run_scheduler(interval_minutes: int = 30):
-    print(f"🚀 스케줄러가 {interval_minutes}분 간격으로 대기 중입니다.")
     while True:
         try:
             await run_global_collection()
         except Exception as e:
-            print(f"❌ 스케줄러 치명적 에러: {e}")
+            print(f"⚠️ 시스템 대기 중: {e}")
         await asyncio.sleep(interval_minutes * 60)
