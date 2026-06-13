@@ -40,3 +40,21 @@ async def get_recommendations(
         target_km=distance
     )
     return {"routes": routes}
+@app.get("/routes/check-status")
+async def check_running_status(
+    lat: float, 
+    lon: float, 
+    route_id: str,
+    heart_rate: int = Query(0)
+):
+    """
+    러너가 뛰는 동안 실시간으로 호출하는 API
+    심박수와 위치를 분석해 보이스 안내 문구를 반환함
+    """
+    status = await route_service.check_route_integrity(lat, lon, route_id)
+    
+    # 심박수 조건 추가 (K 변수)
+    if heart_rate > 160:
+        status["voice_message"] = f"심박수가 {heart_rate}으로 높습니다. 페이스를 낮추세요. " + status["voice_message"]
+        
+    return status

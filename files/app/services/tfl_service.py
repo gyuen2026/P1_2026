@@ -4,97 +4,43 @@ from app.core.config import settings
 
 TFL_BASE = "https://api.tfl.gov.uk"
 
-async def get_road_disruptions(lat: float, lon: float, radius_m: int = 1000) -> list[dict]:
-    """
-    주어진 좌표 반경 내 도로 방해요소(신호 포함) 조회
-    """
-    params = {
-        "app_key": settings.TFL_APP_KEY,
-        "lat": lat,
-        "lon": lon,
-        "radius": radius_m,
-        "categories": "Disruption,RoadProject",
-    }
-    async with httpx.AsyncClient(timeout=10) as client:
-        try:
-            res = await client.get(f"{TFL_BASE}/Place", params=params)
-            if res.status_code != 200:
-                return []
-            return res.json()
-        except Exception:
-            return []
-
-async def fetch_signal_at_point(client, lat, lon):
-    """단일 포인트 신호등 조회 (병렬 처리를 위한 헬퍼)"""
-    params = {
-        "app_key": settings.TFL_APP_KEY,
-        "lat": lat,
-        "lon": lon,
-        "radius": 100,
-        "type": "TrafficSignal",
-    }
-    try:
-        res = await client.get(f"{TFL_BASE}/Place", params=params)
-        return res.json() if res.status_code == 200 else []
-    except Exception:
-        return []
-
-async def get_pedestrian_signals_on_path(waypoints: list[dict]) -> list[dict]:
-    """
-    경로 waypoints 기반으로 보행자 신호등 정보 수집 (병렬 처리 버전)
-    """
-    if not waypoints:
-        return []
-        
-    signals = []
-    # 3개마다 샘플링하여 API 호출 부하 감소
-    sampled_points = waypoints[::3]
-    
-    async with httpx.AsyncClient(timeout=10) as client:
-        # 병렬 요청 생성
-        tasks = [fetch_signal_at_point(client, pt["lat"], pt["lon"]) for pt in sampled_points]
-        results = await asyncio.gather(*tasks)
-        
-        for res in results:
-            if isinstance(res, list):
-                signals.extend(res)
-    return signals
-
-async def get_journey_options(
-    start_lat: float, start_lon: float,
-    end_lat: float, end_lon: float,
-    mode: str = "walking"
-) -> dict:
-    """
-    TfL Journey Planner API - 경로 옵션 조회
-    """
-    params = {
-        "app_key": settings.TFL_APP_KEY,
-        "mode": mode,
-        "alternativeWalking": "true",
-        "walkingSpeed": "Fast",
-        "nationalSearch": "false",
-    }
-    from_str = f"{start_lat},{start_lon}"
-    to_str = f"{end_lat},{end_lon}"
-
+async def get_tfl_data(endpoint, params=None):
+    """TfL API 공통 호출 함수 (에러 처리 강화)"""
+    if params is None: params = {}
+    params["app_key"] = settings.TFL_APP_KEY
     async with httpx.AsyncClient(timeout=15) as client:
         try:
-            res = await client.get(
-                f"{TFL_BASE}/Journey/JourneyResults/{from_str}/to/{to_str}",
-                params=params
-            )
-            if res.status_code != 200:
-                return {"journeys": []} # 안전한 구조 반환
-            return res.json()
+            res = await client.get(f"{TFL_BASE}{endpoint}", params=params)
+            data = res.json()
+            # 로그에 찍힌 에러 방지: 데이터가 리스트인지 확인
+            if res.status_code != 200 or isinstance(data, str):
+                return None
+            return data
         except Exception:
-            return {"journeys": []}
+            return None
 
-async def count_signals_on_path(waypoints: list[dict]) -> int:
-    """
-    경로 좌표를 기반으로 신호등 개수를 추정합니다.
-    """
-    if not waypoints:
-        return 0
-    # 런던 도심 데이터 기준: 좌표 밀도 기반 추정 (8개 좌표당 약 1개 신호등)
-    return max(1, len(waypoints) // 8)
+async def get_bus_arrivals(stop_id):
+    """실시간 버스 도착 정보 (신호등 예측용)"""
+    return await get_tfl_data(f"/StopPoint/{stop_id}/Arrivals")
+
+async def get_road_disruptions():
+    """실시간 도로 사고/공사 정보 (우회 경로 판단용)"""
+    return await get_tfl_data("/Road/All/Disruption")
+
+async def get_nearby_jamcams(lat, lon, radius=500):
+    """주변 도로 영상(CCTV) 주소 가져오기"""
+    data = await get_tfl_data("/Place", {
+        "type": "JamCam",
+        "lat": lat,
+        "lon": lon,
+        "radius": radius
+    })
+    if not data: return []
+    # 영상 URL과 위치 정보만 추출
+    return [{
+        "id": c.get("id"),
+        "name": c.get("commonName"),
+        "imageUrl": next((p["value"] for p in c.get("additionalProperties", []) if p["key"] == "imageUrl"), None),
+        "lat": c.get("lat"),
+        "lon": c.get("lon")
+    } for c in data]
