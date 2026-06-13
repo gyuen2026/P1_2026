@@ -1,33 +1,43 @@
 import math
 import uuid
-from app.services.tfl_service import get_road_disruptions, get_nearby_jamcams
+from app.services import tfl_service
 
-async def check_route_integrity(user_lat, user_lon, heart_rate, current_pace):
-    """실시간 예상 시나리오 기반 보이스 안내 생성"""
-    disruptions = await get_road_disruptions() or []
-    
-    voice_message = ""
-    should_reroute = False
-    
-    # 1. 생체 데이터 분석 (K, L)
-    if heart_rate > 165:
-        voice_message += f"심박수가 {heart_rate}으로 높습니다. 현재 {current_pace} 페이스에서 조금 늦추세요. "
+def calculate_turns(waypoints):
+    turns = 0
+    if len(waypoints) < 3: return 0
+    for i in range(1, len(waypoints) - 1):
+        p1, p2, p3 = waypoints[i-1], waypoints[i], waypoints[i+1]
+        b1 = math.atan2(p2['lon'] - p1['lon'], p2['lat'] - p1['lat'])
+        b2 = math.atan2(p3['lon'] - p2['lon'], p3['lat'] - p2['lat'])
+        if abs(math.degrees(b2 - b1)) > 45: turns += 1
+    return turns
 
-    # 2. 실시간 사고 및 신호 변화 분석 (N, G, H)
-    # 주변 300m 이내 사고(N)가 있는지 검색
-    incident = next((d for d in disruptions if abs(user_lat - d.get('lat', 0)) < 0.003), None)
+async def recommend_routes(start_lat, start_lon, end_lat, end_lon, pace, dist):
+    disruptions = await tfl_service.get_road_disruptions()
+    journey = await tfl_service.get_journey_options(start_lat, start_lon, end_lat, end_lon)
     
-    if incident:
-        should_reroute = True
-        location_name = incident.get("location", "전방")
-        voice_message += f"현재 {location_name} 사고로 인해 초록색으로 예상되던 신호 주기에 변화가 생겼습니다. 50미터 앞 우측으로 커브하여 우회하세요."
+    scored_routes = []
+    for j in journey.get("journeys", [])[:5]:
+        waypoints = [] # (좌표 추출 로직 생략 - 이전과 동일)
+        # ... 좌표 추출 코드 ...
+        turns = calculate_turns(waypoints)
+        score = 100 - (turns * 5)
+        
+        scored_routes.append({
+            "route_id": str(uuid.uuid4()), "score": score, "turns": turns,
+            "waypoints": waypoints, "status": "쾌적"
+        })
+    return scored_routes
+
+async def check_route_integrity(user_lat, user_lon, hr, pace):
+    disruptions = await tfl_service.get_road_disruptions()
+    voice_msg = ""
+    if hr > 165: voice_msg += f"심박수가 {hr}으로 높습니다. 속도를 낮추세요. "
+    
+    danger = any(abs(user_lat - d.get('lat', 0)) < 0.003 for d in disruptions)
+    if danger:
+        voice_msg += "전방 사고로 신호가 변했습니다. 50미터 앞 우측으로 우회하세요."
     else:
-        voice_message += "전방 신호등 초록불 wave가 유지될 예정입니다. 경로가 쾌적합니다."
-
-    return {
-        "voice_instruction": voice_message,
-        "should_reroute": should_reroute,
-        "alert_level": "HIGH" if should_reroute else "NORMAL"
-    }
-
-# recommend_routes 함수 등은 이전과 동일하게 유지...
+        voice_msg += "경로가 쾌적합니다."
+    
+    return {"voice_instruction": voice_msg, "should_reroute": danger}

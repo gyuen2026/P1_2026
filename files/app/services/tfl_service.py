@@ -4,26 +4,44 @@ from app.core.config import settings
 
 TFL_BASE = "https://api.tfl.gov.uk"
 
-async def get_all_stops_in_zones(lat=51.5074, lon=-0.1278, radius=15000):
-    """런던 중심 기준 15km 반경(1~3존) 내의 모든 버스 정류장 찾기"""
-    params = {
-        "lat": lat, "lon": lon, "radius": radius,
-        "stopTypes": "NaptanPublicBusCoachTram",
-        "app_key": settings.TFL_APP_KEY
-    }
+async def get_tfl_data(endpoint, params=None):
+    if params is None: params = {}
+    params["app_key"] = settings.TFL_APP_KEY
     async with httpx.AsyncClient(timeout=20) as client:
         try:
-            res = await client.get(f"{TFL_BASE}/StopPoint", params=params)
-            data = res.json()
-            return data.get("stopPoints", [])
-        except: return []
-
-async def get_all_jamcams():
-    """런던 전역의 모든 JamCam 이미지 데이터 수집"""
-    async with httpx.AsyncClient(timeout=20) as client:
-        try:
-            res = await client.get(f"{TFL_BASE}/Place/Type/JamCam", params={"app_key": settings.TFL_APP_KEY})
+            res = await client.get(f"{TFL_BASE}{endpoint}", params=params)
+            if res.status_code != 200: return None
             return res.json()
-        except: return []
+        except: return None
 
-# 기존 get_bus_arrivals, get_road_disruptions 등은 유지
+async def get_all_stops_in_zones(lat=51.5074, lon=-0.1278, radius=15000):
+    """런던 중심 15km 반경(1-3존) 내 모든 정류장 조회"""
+    return await get_tfl_data("/StopPoint", {
+        "lat": lat, "lon": lon, "radius": radius,
+        "stopTypes": "NaptanPublicBusCoachTram"
+    })
+
+async def get_bus_arrivals(stop_id):
+    """G. 실시간 버스 지연 정보"""
+    return await get_tfl_data(f"/StopPoint/{stop_id}/Arrivals")
+
+async def get_road_disruptions():
+    """N. 실시간 도로 사고/장애 정보"""
+    # 에러 해결: route_service가 찾는 정확한 함수명 보장
+    data = await get_tfl_data("/Road/All/Disruption")
+    return data if data else []
+
+async def get_nearby_jamcams(lat, lon, radius=500):
+    """H. 실시간 도로 영상(CCTV) 정보"""
+    data = await get_tfl_data("/Place", {"type": "JamCam", "lat": lat, "lon": lon, "radius": radius})
+    if not data or isinstance(data, str): return []
+    return [{
+        "id": c.get("id"),
+        "imageUrl": next((p["value"] for p in c.get("additionalProperties", []) if p["key"] == "imageUrl"), None),
+        "lat": c.get("lat"), "lon": c.get("lon")
+    } for c in data]
+
+async def get_journey_options(start_lat, start_lon, end_lat, end_lon):
+    """경로 후보군 추출"""
+    from_loc, to_loc = f"{start_lat},{start_lon}", f"{end_lat},{end_lon}"
+    return await get_tfl_data(f"/Journey/JourneyResults/{from_loc}/to/{to_loc}", {"mode": "walking"})
