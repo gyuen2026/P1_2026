@@ -1,47 +1,144 @@
-import httpx
 import asyncio
+import httpx
 from app.core.config import settings
+from app.services.signal_prediction import normalize_disruptions
 
 TFL_BASE = "https://api.tfl.gov.uk"
+LONDON_CENTER = (51.5074, -0.1278)
+ZONE_12_RADIUS_M = 7500
 
-async def get_tfl_data(endpoint, params=None):
-    if params is None: params = {}
+
+async def get_tfl_data(endpoint: str, params: dict | None = None):
+    if params is None:
+        params = {}
     params["app_key"] = settings.TFL_APP_KEY
-    async with httpx.AsyncClient(timeout=20) as client:
+    async with httpx.AsyncClient(timeout=30) as client:
         try:
             res = await client.get(f"{TFL_BASE}{endpoint}", params=params)
-            if res.status_code != 200: return None
+            if res.status_code != 200:
+                return None
             return res.json()
-        except: return None
+        except Exception:
+            return None
 
-async def get_all_stops_in_zones(lat=51.5074, lon=-0.1278, radius=15000):
-    """런던 중심 15km 반경(1-3존) 내 모든 정류장 조회"""
-    return await get_tfl_data("/StopPoint", {
-        "lat": lat, "lon": lon, "radius": radius,
-        "stopTypes": "NaptanPublicBusCoachTram"
-    })
 
-async def get_bus_arrivals(stop_id):
-    """G. 실시간 버스 지연 정보"""
+async def get_all_stops_in_zones(
+    lat: float = LONDON_CENTER[0],
+    lon: float = LONDON_CENTER[1],
+    radius: int = ZONE_12_RADIUS_M,
+) -> dict:
+    """
+    Fetch all bus stops in London Zones 1-2 (~7.5 km radius).
+    Paginates until every stop is retrieved (~4,000+).
+    """
+    all_stops: list[dict] = []
+    seen: set[str] = set()
+    page = 1
+
+    while True:
+        data = await get_tfl_data("/StopPoint", {
+            "lat": lat,
+            "lon": lon,
+            "radius": radius,
+            "stopTypes": "NaptanPublicBusCoachTram",
+            "page": page,
+        })
+        if not data:
+            break
+
+        batch = data.get("stopPoints") or []
+        for stop in batch:
+            sid = stop.get("id")
+            if sid and sid not in seen:
+                seen.add(sid)
+                all_stops.append(stop)
+
+        total = data.get("total") or len(all_stops)
+        if not batch or len(all_stops) >= total:
+            break
+        page += 1
+        await asyncio.sleep(0.2)
+
+    return {"stopPoints": all_stops, "total": len(all_stops)}
+
+
+async def get_bus_arrivals(stop_id: str):
+    """G. Real-time bus delay data for a stop."""
     return await get_tfl_data(f"/StopPoint/{stop_id}/Arrivals")
 
-async def get_road_disruptions():
-    """N. 실시간 도로 사고/장애 정보"""
-    # 에러 해결: route_service가 찾는 정확한 함수명 보장
-    data = await get_tfl_data("/Road/All/Disruption")
-    return data if data else []
 
-async def get_nearby_jamcams(lat, lon, radius=500):
-    """H. 실시간 도로 영상(CCTV) 정보"""
-    data = await get_tfl_data("/Place", {"type": "JamCam", "lat": lat, "lon": lon, "radius": radius})
-    if not data or isinstance(data, str): return []
+async def get_road_disruptions() -> list[dict]:
+    """N. Live road accident/disruption data with parsed coordinates."""
+    data = await get_tfl_data("/Road/All/Disruption")
+    return normalize_disruptions(data if isinstance(data, list) else [])
+
+
+async def get_nearby_jamcams(lat: float, lon: float, radius: int = 500) -> list[dict]:
+    """H. Live JamCam CCTV URLs near a coordinate."""
+    data = await get_tfl_data("/Place", {
+        "type": "JamCam",
+        "lat": lat,
+        "lon": lon,
+        "radius": radius,
+    })
+    if not data or isinstance(data, str):
+        return []
     return [{
         "id": c.get("id"),
-        "imageUrl": next((p["value"] for p in c.get("additionalProperties", []) if p["key"] == "imageUrl"), None),
-        "lat": c.get("lat"), "lon": c.get("lon")
-    } for c in data]
+        "imageUrl": next(
+            (p["value"] for p in c.get("additionalProperties", []) if p.get("key") == "imageUrl"),
+            None,
+        ),
+        "lat": c.get("lat"),
+        "lon": c.get("lon"),
+        "commonName": c.get("commonName"),
+    } for c in data if isinstance(c, dict)]
 
-async def get_journey_options(start_lat, start_lon, end_lat, end_lon):
-    """경로 후보군 추출"""
-    from_loc, to_loc = f"{start_lat},{start_lon}", f"{end_lat},{end_lon}"
-    return await get_tfl_data(f"/Journey/JourneyResults/{from_loc}/to/{to_loc}", {"mode": "walking"})
+
+async def get_journey_options(start_lat: float, start_lon: float, end_lat: float, end_lon: float):
+    """Walking journey candidates between two points."""
+    from_loc = f"{start_lat},{start_lon}"
+    to_loc = f"{end_lat},{end_lon}"
+    return await get_tfl_data(
+        f"/Journey/JourneyResults/{from_loc}/to/{to_loc}",
+        {"mode": "walking", "alternativeCycle": "true"},
+    )
+
+
+def decode_line_string(line_string: str) -> list[dict]:
+    """Decode TfL GeoJSON lineString (lon lat pairs) into waypoint dicts."""
+    if not line_string:
+        return []
+    waypoints = []
+    parts = line_string.strip().split()
+    for i in range(0, len(parts) - 1, 2):
+        try:
+            lon, lat = float(parts[i]), float(parts[i + 1])
+            waypoints.append({"lat": lat, "lon": lon})
+        except (ValueError, IndexError):
+            continue
+    return waypoints
+
+
+def extract_waypoints_from_journey(journey: dict) -> list[dict]:
+    """Extract polyline coordinates from a TfL walking journey."""
+    waypoints: list[dict] = []
+    for leg in journey.get("legs") or []:
+        path = leg.get("path") or {}
+        line_string = path.get("lineString") or ""
+        waypoints.extend(decode_line_string(line_string))
+
+        for pt_key in ("departurePoint", "arrivalPoint"):
+            pt = leg.get(pt_key) or {}
+            lat, lon = pt.get("lat"), pt.get("lon")
+            if lat is not None and lon is not None:
+                coord = {"lat": float(lat), "lon": float(lon)}
+                if not waypoints or waypoints[-1] != coord:
+                    waypoints.append(coord)
+
+    # Deduplicate consecutive identical points
+    deduped: list[dict] = []
+    for wp in waypoints:
+        if not deduped or deduped[-1] != wp:
+            deduped.append(wp)
+    return deduped

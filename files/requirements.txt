@@ -8,4 +8,5 @@ pydantic-settings==2.2.1
 geopy==2.4.1
 networkx==3.3
 numpy==1.26.4
+Pillow==10.3.0
 python-multipart==0.0.9

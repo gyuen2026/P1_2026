@@ -7,8 +7,9 @@
 """
 import httpx
 import math
-from datetime import datetime, timezone
+from datetime import datetime
 from app.core.config import settings
+from app.services.signal_prediction import get_london_now
 
 TFL_BASE = "https://api.tfl.gov.uk"
 
@@ -207,9 +208,11 @@ async def calc_route_red_probability(
       green_wave_score: 초록불 연속 확률 점수 (0~100)
     """
     if depart_time is None:
-        depart_time = datetime.now(timezone.utc)
+        depart_time = get_london_now()
+    elif depart_time.tzinfo is None:
+        depart_time = depart_time.replace(tzinfo=get_london_now().tzinfo)
 
-    hour = depart_time.hour
+    hour = depart_time.astimezone(get_london_now().tzinfo).hour
     time_weight = get_time_weight(hour)
 
     # 경로 위 버스 정류장 = 신호등 위치 프록시

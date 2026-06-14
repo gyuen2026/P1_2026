@@ -1,6 +1,6 @@
 from fastapi import APIRouter, HTTPException
 from app.models.route import RouteRequest, RouteResponse, SessionSaveRequest
-from app.services.route_service import recommend_routes
+from app.services.route_service import recommend_routes, check_route_integrity
 from app.services.weather_service import get_current_weather, get_weather_summary
 
 router = APIRouter(prefix="/routes", tags=["routes"])
@@ -38,3 +38,21 @@ async def get_weather(lat: float, lon: float):
         "summary": get_weather_summary(weather),
         **weather
     }
+
+
+@router.get("/check-status")
+async def check_route_status(
+    lat: float,
+    lon: float,
+    hr: int = 0,
+    pace: float = 0,
+    speed_kmh: float = 0,
+):
+    """Real-time rerouting and coaching during an active run."""
+    return await check_route_integrity(
+        user_lat=lat,
+        user_lon=lon,
+        hr=hr,
+        pace=pace,
+        speed_kmh=speed_kmh if speed_kmh > 0 else None,
+    )
