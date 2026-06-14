@@ -413,15 +413,34 @@ def build_observation_record(
     }
 
 
-def parse_disruption_point(point: str | None) -> tuple[float | None, float | None]:
-    """Parse GeoJSON Point string from TfL road disruption."""
-    if not point:
+def parse_disruption_point(point) -> tuple[float | None, float | None]:
+    """
+    Parse TfL road disruption location.
+    TfL returns point as '[lon, lat]' JSON array string, not a GeoJSON Point object.
+    """
+    if point is None:
         return None, None
-    try:
-        geo = json.loads(point)
-        coords = geo.get("coordinates", [])
+
+    if isinstance(point, (list, tuple)) and len(point) >= 2:
+        return float(point[1]), float(point[0])
+
+    if isinstance(point, dict):
+        coords = point.get("coordinates") or []
         if len(coords) >= 2:
             return float(coords[1]), float(coords[0])
+        return None, None
+
+    if not isinstance(point, str):
+        return None, None
+
+    try:
+        geo = json.loads(point)
+        if isinstance(geo, list) and len(geo) >= 2:
+            return float(geo[1]), float(geo[0])
+        if isinstance(geo, dict):
+            coords = geo.get("coordinates") or []
+            if len(coords) >= 2:
+                return float(coords[1]), float(coords[0])
     except (json.JSONDecodeError, TypeError, ValueError):
         pass
     return None, None
@@ -440,7 +459,7 @@ def normalize_disruptions(raw: list | None) -> list[dict]:
             lat, lon = d.get("lat"), d.get("lon")
         results.append({
             "id": d.get("id"),
-            "location": d.get("location") or d.get("comments", "")[:80],
+            "location": d.get("location") or str(d.get("comments") or "")[:80],
             "category": d.get("category"),
             "severity": d.get("severity"),
             "status": d.get("status"),
