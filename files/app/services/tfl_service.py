@@ -1,5 +1,8 @@
 import asyncio
+import traceback
+
 import httpx
+
 from app.core.config import settings
 from app.services.signal_prediction import normalize_disruptions
 
@@ -7,12 +10,25 @@ TFL_BASE = "https://api.tfl.gov.uk"
 LONDON_CENTER = (51.5074, -0.1278)
 ZONE_12_RADIUS_M = 7500
 
+# Geo queries cover Zone 1-2 better as overlapping tiles (no `page` param — it 404s).
+LONDON_GRID = [
+    (51.5074, -0.1278),
+    (51.5230, -0.1050),
+    (51.4920, -0.1520),
+    (51.5150, -0.0750),
+    (51.4980, -0.0950),
+]
 
-async def get_tfl_data(endpoint: str, params: dict | None = None):
+
+def _is_tfl_error(data) -> bool:
+    return isinstance(data, dict) and bool(data.get("httpStatusCode"))
+
+
+async def get_tfl_data(endpoint: str, params: dict | None = None, timeout: float = 30):
     if params is None:
         params = {}
     params["app_key"] = settings.TFL_APP_KEY
-    async with httpx.AsyncClient(timeout=30) as client:
+    async with httpx.AsyncClient(timeout=timeout) as client:
         try:
             res = await client.get(f"{TFL_BASE}{endpoint}", params=params)
             if res.status_code != 200:
@@ -23,10 +39,12 @@ async def get_tfl_data(endpoint: str, params: dict | None = None):
 
 
 def _extract_stop_points(data) -> tuple[list[dict], int | None]:
-    """TfL StopPoint responses may be a dict or a raw list depending on endpoint/params."""
+    """TfL StopPoint responses may be a dict or a raw list."""
     if isinstance(data, list):
         return [s for s in data if isinstance(s, dict)], len(data)
     if isinstance(data, dict):
+        if _is_tfl_error(data):
+            return [], None
         batch = data.get("stopPoints") or data.get("StopPoints") or []
         if not isinstance(batch, list):
             batch = []
@@ -35,49 +53,54 @@ def _extract_stop_points(data) -> tuple[list[dict], int | None]:
     return [], None
 
 
+def parse_stops_payload(stops_data) -> list[dict]:
+    """Safely extract stop dicts from any TfL payload shape."""
+    batch, _ = _extract_stop_points(stops_data)
+    return batch
+
+
+async def _fetch_stops_at(lat: float, lon: float, radius: int) -> list[dict]:
+    """Single geo StopPoint query — never pass `page` (breaks this endpoint)."""
+    data = await get_tfl_data(
+        "/StopPoint",
+        {
+            "lat": lat,
+            "lon": lon,
+            "radius": radius,
+            "stopTypes": "NaptanPublicBusCoachTram",
+        },
+        timeout=90,
+    )
+    if not data or _is_tfl_error(data):
+        return []
+    batch, _ = _extract_stop_points(data)
+    return batch
+
+
 async def get_all_stops_in_zones(
     lat: float = LONDON_CENTER[0],
     lon: float = LONDON_CENTER[1],
     radius: int = ZONE_12_RADIUS_M,
 ) -> dict:
     """
-    Fetch all bus stops in London Zones 1-2 (~7.5 km radius).
-    Paginates until every stop is retrieved (~4,000+).
+    Fetch bus stops across London Zones 1-2 using overlapping geo tiles.
     """
     all_stops: list[dict] = []
     seen: set[str] = set()
-    page = 1
+    tile_radius = min(radius, 4000)
 
-    while True:
-        data = await get_tfl_data("/StopPoint", {
-            "lat": lat,
-            "lon": lon,
-            "radius": radius,
-            "stopTypes": "NaptanPublicBusCoachTram",
-            "page": page,
-        })
-        if not data:
-            break
+    centers = LONDON_GRID if (lat, lon) == LONDON_CENTER else [(lat, lon)]
 
-        batch, total = _extract_stop_points(data)
+    for center_lat, center_lon in centers:
+        batch = await _fetch_stops_at(center_lat, center_lon, tile_radius)
         for stop in batch:
             sid = stop.get("id")
             if sid and sid not in seen:
                 seen.add(sid)
                 all_stops.append(stop)
+        await asyncio.sleep(0.3)
 
-        if not batch:
-            break
-        if total is not None and len(all_stops) >= total:
-            break
-        # Geo search often returns everything on page 1 with no further pages
-        if isinstance(data, list) or page > 1 and len(batch) == 0:
-            break
-        page += 1
-        await asyncio.sleep(0.2)
-        if page > 50:
-            break
-
+    print(f"  TfL: {len(all_stops)} unique stops from {len(centers)} tiles", flush=True)
     return {"stopPoints": all_stops, "total": len(all_stops)}
 
 
@@ -88,13 +111,21 @@ async def get_bus_arrivals(stop_id: str):
 
 async def get_road_disruptions() -> list[dict]:
     """N. Live road accident/disruption data with parsed coordinates."""
-    data = await get_tfl_data("/Road/All/Disruption")
-    if isinstance(data, list):
-        return normalize_disruptions(data)
-    if isinstance(data, dict):
-        items = data.get("disruptions") or data.get("Disruptions") or []
-        return normalize_disruptions(items if isinstance(items, list) else [])
-    return []
+    try:
+        data = await get_tfl_data("/Road/All/Disruption")
+        if isinstance(data, list):
+            return normalize_disruptions(data)
+        if isinstance(data, dict):
+            if _is_tfl_error(data):
+                return []
+            items = data.get("disruptions") or data.get("Disruptions")
+            if isinstance(items, list):
+                return normalize_disruptions(items)
+            return []
+        return []
+    except Exception as exc:
+        print(f"  ⚠️ Road disruption fetch failed: {exc}", flush=True)
+        return []
 
 
 async def get_nearby_jamcams(lat: float, lon: float, radius: int = 500) -> list[dict]:
@@ -107,26 +138,32 @@ async def get_nearby_jamcams(lat: float, lon: float, radius: int = 500) -> list[
     })
     if not data or isinstance(data, str):
         return []
+    places = data if isinstance(data, list) else data.get("places") or []
+    if not isinstance(places, list):
+        return []
     return [{
         "id": c.get("id"),
         "imageUrl": next(
-            (p["value"] for p in c.get("additionalProperties", []) if p.get("key") == "imageUrl"),
+            (p["value"] for p in (c.get("additionalProperties") or []) if p.get("key") == "imageUrl"),
             None,
         ),
         "lat": c.get("lat"),
         "lon": c.get("lon"),
         "commonName": c.get("commonName"),
-    } for c in data if isinstance(c, dict)]
+    } for c in places if isinstance(c, dict)]
 
 
 async def get_journey_options(start_lat: float, start_lon: float, end_lat: float, end_lon: float):
     """Walking journey candidates between two points."""
     from_loc = f"{start_lat},{start_lon}"
     to_loc = f"{end_lat},{end_lon}"
-    return await get_tfl_data(
+    data = await get_tfl_data(
         f"/Journey/JourneyResults/{from_loc}/to/{to_loc}",
         {"mode": "walking", "alternativeCycle": "true"},
     )
+    if isinstance(data, dict):
+        return data
+    return {}
 
 
 def decode_line_string(line_string: str) -> list[dict]:
@@ -146,21 +183,26 @@ def decode_line_string(line_string: str) -> list[dict]:
 
 def extract_waypoints_from_journey(journey: dict) -> list[dict]:
     """Extract polyline coordinates from a TfL walking journey."""
+    if not isinstance(journey, dict):
+        return []
     waypoints: list[dict] = []
     for leg in journey.get("legs") or []:
+        if not isinstance(leg, dict):
+            continue
         path = leg.get("path") or {}
         line_string = path.get("lineString") or ""
         waypoints.extend(decode_line_string(line_string))
 
         for pt_key in ("departurePoint", "arrivalPoint"):
             pt = leg.get(pt_key) or {}
-            lat, lon = pt.get("lat"), pt.get("lon")
-            if lat is not None and lon is not None:
-                coord = {"lat": float(lat), "lon": float(lon)}
+            if not isinstance(pt, dict):
+                continue
+            plat, plon = pt.get("lat"), pt.get("lon")
+            if plat is not None and plon is not None:
+                coord = {"lat": float(plat), "lon": float(plon)}
                 if not waypoints or waypoints[-1] != coord:
                     waypoints.append(coord)
 
-    # Deduplicate consecutive identical points
     deduped: list[dict] = []
     for wp in waypoints:
         if not deduped or deduped[-1] != wp:

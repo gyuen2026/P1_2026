@@ -429,7 +429,7 @@ def parse_disruption_point(point: str | None) -> tuple[float | None, float | Non
 
 def normalize_disruptions(raw: list | None) -> list[dict]:
     """Normalize TfL road disruption payloads with lat/lon and location name."""
-    if not raw:
+    if not raw or not isinstance(raw, list):
         return []
     results = []
     for d in raw:

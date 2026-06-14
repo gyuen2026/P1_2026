@@ -1,10 +1,12 @@
 import asyncio
+import traceback
 from collections import defaultdict
 
 from supabase import create_client
 
 from app.core.config import settings
 from app.services import tfl_service
+from app.services.tfl_service import parse_stops_payload
 from app.services.signal_prediction import (
     build_observation_record,
     calc_delay_from_arrivals,
@@ -150,18 +152,15 @@ async def run_global_collection():
     )
 
     disruptions = await tfl_service.get_road_disruptions()
+
     try:
         stops_data = await tfl_service.get_all_stops_in_zones(radius=7500)
     except Exception as exc:
         print(f"⚠️ Failed to fetch stops from TfL: {exc}", flush=True)
+        traceback.print_exc()
         return
 
-    if isinstance(stops_data, list):
-        stops = stops_data
-    elif isinstance(stops_data, dict):
-        stops = stops_data.get("stopPoints", [])
-    else:
-        stops = []
+    stops = parse_stops_payload(stops_data)
 
     if not stops:
         print("⚠️ No stops returned from TfL API.")
@@ -219,7 +218,8 @@ async def run_scheduler(interval_minutes: int = 30):
         try:
             await run_global_collection()
         except Exception as e:
-            print(f"⚠️ Collection error: {e}")
+            print(f"⚠️ Collection error: {e}", flush=True)
+            traceback.print_exc()
         await asyncio.sleep(interval_minutes * 60)
 
 
