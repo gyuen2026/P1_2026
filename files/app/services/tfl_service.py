@@ -22,6 +22,19 @@ async def get_tfl_data(endpoint: str, params: dict | None = None):
             return None
 
 
+def _extract_stop_points(data) -> tuple[list[dict], int | None]:
+    """TfL StopPoint responses may be a dict or a raw list depending on endpoint/params."""
+    if isinstance(data, list):
+        return [s for s in data if isinstance(s, dict)], len(data)
+    if isinstance(data, dict):
+        batch = data.get("stopPoints") or data.get("StopPoints") or []
+        if not isinstance(batch, list):
+            batch = []
+        total = data.get("total") or data.get("$totalStops")
+        return batch, total
+    return [], None
+
+
 async def get_all_stops_in_zones(
     lat: float = LONDON_CENTER[0],
     lon: float = LONDON_CENTER[1],
@@ -46,18 +59,24 @@ async def get_all_stops_in_zones(
         if not data:
             break
 
-        batch = data.get("stopPoints") or []
+        batch, total = _extract_stop_points(data)
         for stop in batch:
             sid = stop.get("id")
             if sid and sid not in seen:
                 seen.add(sid)
                 all_stops.append(stop)
 
-        total = data.get("total") or len(all_stops)
-        if not batch or len(all_stops) >= total:
+        if not batch:
+            break
+        if total is not None and len(all_stops) >= total:
+            break
+        # Geo search often returns everything on page 1 with no further pages
+        if isinstance(data, list) or page > 1 and len(batch) == 0:
             break
         page += 1
         await asyncio.sleep(0.2)
+        if page > 50:
+            break
 
     return {"stopPoints": all_stops, "total": len(all_stops)}
 
@@ -70,7 +89,12 @@ async def get_bus_arrivals(stop_id: str):
 async def get_road_disruptions() -> list[dict]:
     """N. Live road accident/disruption data with parsed coordinates."""
     data = await get_tfl_data("/Road/All/Disruption")
-    return normalize_disruptions(data if isinstance(data, list) else [])
+    if isinstance(data, list):
+        return normalize_disruptions(data)
+    if isinstance(data, dict):
+        items = data.get("disruptions") or data.get("Disruptions") or []
+        return normalize_disruptions(items if isinstance(items, list) else [])
+    return []
 
 
 async def get_nearby_jamcams(lat: float, lon: float, radius: int = 500) -> list[dict]:

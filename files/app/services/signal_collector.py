@@ -150,8 +150,18 @@ async def run_global_collection():
     )
 
     disruptions = await tfl_service.get_road_disruptions()
-    stops_data = await tfl_service.get_all_stops_in_zones(radius=7500)
-    stops = stops_data.get("stopPoints", []) if stops_data else []
+    try:
+        stops_data = await tfl_service.get_all_stops_in_zones(radius=7500)
+    except Exception as exc:
+        print(f"⚠️ Failed to fetch stops from TfL: {exc}", flush=True)
+        return
+
+    if isinstance(stops_data, list):
+        stops = stops_data
+    elif isinstance(stops_data, dict):
+        stops = stops_data.get("stopPoints", [])
+    else:
+        stops = []
 
     if not stops:
         print("⚠️ No stops returned from TfL API.")
