@@ -10,7 +10,7 @@ from app.services.signal_prediction import (
     calc_delay_from_arrivals,
     get_london_now,
     london_hour_and_dow,
-    predict_signal_state_with_jamcam,
+    predict_signal_state,
 )
 
 BATCH_SIZE = 10
@@ -73,12 +73,10 @@ async def process_and_save_stop(stop: dict, db, disruptions: list[dict]) -> bool
     except Exception:
         pass
 
-    jamcams = await tfl_service.get_nearby_jamcams(lat, lon, radius=400)
-
-    prediction = await predict_signal_state_with_jamcam(
+    # Bulk collection: G+N only (fast). JamCam H double-check runs live in route_service.
+    prediction = predict_signal_state(
         avg_delay_sec=avg_delay,
         sample_count=sample_count,
-        jamcams=jamcams,
         disruptions=disruptions,
         lat=lat,
         lon=lon,
@@ -100,7 +98,7 @@ async def process_and_save_stop(stop: dict, db, disruptions: list[dict]) -> bool
         db.table("bus_signal_observations").insert(record).execute()
         return True
     except Exception as exc:
-        print(f"  ⚠️ Insert failed for {stop_id}: {exc}")
+        print(f"  ⚠️ Insert failed for {stop_id}: {exc}", flush=True)
         return False
 
 
@@ -159,25 +157,32 @@ async def run_global_collection():
         print("⚠️ No stops returned from TfL API.")
         return
 
-    print(f"🔎 Processing {len(stops)} stops (target: 4,000+)...")
+    print(f"🔎 Processing {len(stops)} stops (target: 4,000+)...", flush=True)
 
     saved = 0
     skipped = 0
-    batch_records: list[dict] = []
 
     for i in range(0, len(stops), BATCH_SIZE):
         chunk = stops[i : i + BATCH_SIZE]
         results = await asyncio.gather(
             *[process_and_save_stop(s, db, disruptions) for s in chunk]
         )
-        saved += sum(1 for r in results if r)
+        batch_saved = sum(1 for r in results if r)
+        saved += batch_saved
         skipped += sum(1 for r in results if not r)
         await asyncio.sleep(BATCH_DELAY_SEC)
 
-        if (i // BATCH_SIZE) % 20 == 0 and i > 0:
-            print(f"  … {i}/{len(stops)} processed, {saved} saved")
+        if saved == batch_saved and saved <= BATCH_SIZE and batch_saved > 0:
+            print(f"  ✅ First rows inserted successfully ({saved} so far)", flush=True)
+        if saved == 0 and i >= BATCH_SIZE * 5:
+            print(
+                "  ❌ Zero inserts after 50 stops — check Render logs for "
+                "'Insert failed'. Likely Supabase RLS or wrong SUPABASE_KEY.",
+                flush=True,
+            )
+        if i > 0 and (i // BATCH_SIZE) % 10 == 0:
+            print(f"  … {i}/{len(stops)} processed, {saved} saved", flush=True)
 
-    # Refresh patterns from latest hour's data
     hour, dow = london_hour_and_dow(now)
     try:
         recent = (
@@ -189,12 +194,14 @@ async def run_global_collection():
             .limit(500)
             .execute()
         )
-        batch_records = recent.data or []
-        await upsert_signal_patterns(db, batch_records)
+        await upsert_signal_patterns(db, recent.data or [])
     except Exception as exc:
-        print(f"⚠️ Pattern refresh failed: {exc}")
+        print(f"⚠️ Pattern refresh failed: {exc}", flush=True)
 
-    print(f"✨ Collection complete: {saved} saved, {skipped} skipped (invalid coords).")
+    print(
+        f"✨ Collection complete: {saved} saved, {skipped} skipped.",
+        flush=True,
+    )
 
 
 async def run_scheduler(interval_minutes: int = 30):
