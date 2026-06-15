@@ -3,11 +3,7 @@ import uuid
 
 from app.services import tfl_service
 from app.services.bus_signal_service import calc_route_red_probability
-from app.services.signal_prediction import (
-    _haversine_km,
-    get_london_now,
-    predict_signal_state_with_jamcam,
-)
+from app.services.fusion_service import predict_signal_at_location
 
 
 def calculate_turns(waypoints: list[dict]) -> int:
@@ -231,14 +227,7 @@ async def check_route_integrity(
     disruptions = await tfl_service.get_road_disruptions()
     effective_speed = speed_kmh if speed_kmh else (60 / pace if pace > 0 else 0)
 
-    # Check signal change at nearest bus stop proxy
-    jamcams = await tfl_service.get_nearby_jamcams(user_lat, user_lon, radius=300)
-    signal = await predict_signal_state_with_jamcam(
-        jamcams=jamcams,
-        disruptions=disruptions,
-        lat=user_lat,
-        lon=user_lon,
-    )
+    signal = await predict_signal_at_location(user_lat, user_lon, include_jamcam=True)
 
     result = generate_voice_instruction(
         user_lat=user_lat,

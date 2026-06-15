@@ -7,17 +7,32 @@ from supabase import create_client
 from app.core.config import settings
 from app.services import tfl_service
 from app.services.tfl_service import parse_stops_payload
+from app.services.fusion_service import predict_signal_fused
+from app.services.osm_crossings import ensure_crossings_loaded, is_near_traffic_signal
 from app.services.signal_prediction import (
     build_observation_record,
-    calc_delay_from_arrivals,
+    calc_delay_detail,
+    estimate_delay_confidence,
+    extract_stop_coords,
     get_london_now,
+    is_valid_london_coord,
     london_hour_and_dow,
-    predict_signal_state,
 )
+from app.services.vehicle_signal_service import infer_vehicle_hold, load_bus_positions_for_cycle
 
 BATCH_SIZE = 10
 BATCH_DELAY_SEC = 0.5
 ARRIVAL_TIMEOUT_SEC = 5.0
+
+_collection_lock = asyncio.Lock()
+_collection_state = {
+    "running": False,
+    "last_started": None,
+    "last_finished": None,
+    "last_saved": 0,
+    "last_skipped": 0,
+    "last_error": None,
+}
 
 
 def get_supabase():
@@ -44,16 +59,26 @@ async def get_learned_pattern(stop_id: str, hour: int, dow: int) -> dict | None:
     return None
 
 
-async def process_and_save_stop(stop: dict, db, disruptions: list[dict]) -> bool:
+async def process_and_save_stop(
+    stop: dict,
+    db,
+    disruptions: list[dict],
+    *,
+    osm_crossings: list[dict] | None = None,
+    cycle_vehicles: list[dict] | None = None,
+    signal_only: bool = True,
+) -> bool:
     """
-    Collect G+H, predict F, and insert a fully populated observation row.
+    Collect G+V+P+N+O via free fusion, insert observation row.
     Returns True if a row was saved.
     """
-    from app.services.signal_prediction import extract_stop_coords, is_valid_london_coord
-
     lat, lon = extract_stop_coords(stop)
     if not is_valid_london_coord(lat, lon):
         return False
+
+    if signal_only and osm_crossings is not None:
+        if not is_near_traffic_signal(lat, lon, osm_crossings):
+            return False
 
     stop_id = stop.get("id") or stop.get("naptanId")
     if not stop_id:
@@ -64,6 +89,9 @@ async def process_and_save_stop(stop: dict, db, disruptions: list[dict]) -> bool
 
     learned = await get_learned_pattern(str(stop_id), hour, dow)
     avg_delay, sample_count = 0.0, 0
+    delay_methods: list[str] = []
+    bus_count = 0
+    detail: dict = {}
 
     try:
         arrivals = await asyncio.wait_for(
@@ -71,20 +99,35 @@ async def process_and_save_stop(stop: dict, db, disruptions: list[dict]) -> bool
             timeout=ARRIVAL_TIMEOUT_SEC,
         )
         if isinstance(arrivals, list):
-            avg_delay, sample_count = calc_delay_from_arrivals(arrivals)
+            detail = calc_delay_detail(arrivals, now)
+            avg_delay = detail["avg_delay_sec"]
+            sample_count = detail["sample_count"]
+            delay_methods = detail.get("methods", [])
+            bus_count = detail.get("bus_count", 0)
+            if delay_methods:
+                detail["confidence"] = estimate_delay_confidence(
+                    sample_count, delay_methods, bus_count
+                )
     except Exception:
         pass
 
-    # Bulk collection: G+N only (fast). JamCam H double-check runs live in route_service.
-    prediction = predict_signal_state(
-        avg_delay_sec=avg_delay,
-        sample_count=sample_count,
-        disruptions=disruptions,
+    vehicle_hold = infer_vehicle_hold(lat, lon, cycle_vehicles)
+
+    # Free-tier fusion: G + V + P + N + O (JamCam + crowd on live routes only)
+    prediction = await predict_signal_fused(
         lat=lat,
         lon=lon,
+        avg_delay_sec=avg_delay,
+        sample_count=sample_count,
+        delay_detail=detail if sample_count else None,
         learned=learned,
+        disruptions=disruptions,
+        vehicle_hold=vehicle_hold,
+        osm_crossings=osm_crossings,
         hour=hour,
     )
+    if delay_methods:
+        prediction["sources"]["delay_methods"] = delay_methods
 
     record = build_observation_record(
         stop,
@@ -143,15 +186,25 @@ async def upsert_signal_patterns(db, observations: list[dict]):
             print(f"  ⚠️ Pattern upsert failed for {stop_id}: {exc}")
 
 
-async def run_global_collection():
+async def run_global_collection(stop_limit: int | None = None):
     db = get_supabase()
     now = get_london_now()
+    _collection_state["last_started"] = now.isoformat()
+    _collection_state["last_error"] = None
     print(
         f"🌍 [{now.strftime('%H:%M:%S')} London] Zone 1-2 collection "
         f"(dow={now.isoweekday()}, hour={now.hour})"
     )
 
     disruptions = await tfl_service.get_road_disruptions()
+
+    print("  Loading free-tier sources (OSM + VehiclePositions)...", flush=True)
+    osm_crossings = await ensure_crossings_loaded()
+    cycle_vehicles = await load_bus_positions_for_cycle()
+    print(
+        f"  OSM signals: {len(osm_crossings)}, buses tracked: {len(cycle_vehicles)}",
+        flush=True,
+    )
 
     try:
         stops_data = await tfl_service.get_all_stops_in_zones(radius=7500)
@@ -161,6 +214,10 @@ async def run_global_collection():
         return
 
     stops = parse_stops_payload(stops_data)
+
+    if stop_limit:
+        stops = stops[:stop_limit]
+        print(f"🔎 Smoke test: limited to {len(stops)} stops", flush=True)
 
     if not stops:
         print("⚠️ No stops returned from TfL API.")
@@ -174,7 +231,16 @@ async def run_global_collection():
     for i in range(0, len(stops), BATCH_SIZE):
         chunk = stops[i : i + BATCH_SIZE]
         results = await asyncio.gather(
-            *[process_and_save_stop(s, db, disruptions) for s in chunk]
+            *[
+                process_and_save_stop(
+                    s,
+                    db,
+                    disruptions,
+                    osm_crossings=osm_crossings,
+                    cycle_vehicles=cycle_vehicles,
+                )
+                for s in chunk
+            ]
         )
         batch_saved = sum(1 for r in results if r)
         saved += batch_saved
@@ -211,13 +277,43 @@ async def run_global_collection():
         f"✨ Collection complete: {saved} saved, {skipped} skipped.",
         flush=True,
     )
+    _collection_state["last_finished"] = get_london_now().isoformat()
+    _collection_state["last_saved"] = saved
+    _collection_state["last_skipped"] = skipped
+    return {"saved": saved, "skipped": skipped}
+
+
+async def trigger_collection() -> dict:
+    """Run one collection cycle (skip if already running)."""
+    if _collection_lock.locked():
+        return {"status": "already_running", **_collection_state}
+    async with _collection_lock:
+        _collection_state["running"] = True
+        try:
+            result = await run_global_collection()
+            return {"status": "completed", **result, **_collection_state}
+        except Exception as exc:
+            _collection_state["last_error"] = str(exc)
+            raise
+        finally:
+            _collection_state["running"] = False
+
+
+def get_collection_status() -> dict:
+    return dict(_collection_state)
 
 
 async def run_scheduler(interval_minutes: int = 30):
     while True:
         try:
-            await run_global_collection()
+            async with _collection_lock:
+                _collection_state["running"] = True
+                try:
+                    await run_global_collection()
+                finally:
+                    _collection_state["running"] = False
         except Exception as e:
+            _collection_state["last_error"] = str(e)
             print(f"⚠️ Collection error: {e}", flush=True)
             traceback.print_exc()
         await asyncio.sleep(interval_minutes * 60)

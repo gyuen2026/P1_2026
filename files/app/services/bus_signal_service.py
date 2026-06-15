@@ -17,9 +17,11 @@ TFL_BASE = "https://api.tfl.gov.uk"
 # ── 1. 경로 근처 버스 정류장 찾기 ──────────────────────────────────
 async def get_stops_near_path(waypoints: list[dict], radius_m: int = 60) -> list[dict]:
     """
-    경로 좌표 근처 버스 정류장 목록 반환
-    신호등이 있는 교차로 근처 정류장만 유효
+    경로 좌표 근처 버스 정류장 — OSM traffic_signals geofence로 필터 (무료 정확도↑)
     """
+    from app.services.osm_crossings import ensure_crossings_loaded, is_near_traffic_signal
+
+    crossings = await ensure_crossings_loaded()
     stops = []
     seen_ids = set()
 
@@ -42,13 +44,19 @@ async def get_stops_near_path(waypoints: list[dict], radius_m: int = 60) -> list
                     data = res.json()
                     for stop in data.get("stopPoints", []):
                         sid = stop.get("id")
+                        slat, slon = stop.get("lat"), stop.get("lon")
                         if sid and sid not in seen_ids:
+                            if slat is not None and slon is not None:
+                                if crossings and not is_near_traffic_signal(
+                                    float(slat), float(slon), crossings
+                                ):
+                                    continue
                             seen_ids.add(sid)
                             stops.append({
                                 "id": sid,
                                 "name": stop.get("commonName", ""),
-                                "lat": stop.get("lat"),
-                                "lon": stop.get("lon"),
+                                "lat": slat,
+                                "lon": slon,
                             })
             except Exception:
                 continue
@@ -79,42 +87,25 @@ async def get_signal_wait_estimate(stop_id: str) -> dict:
                 return _default_signal_estimate()
 
             arrivals = res.json()
-            if not arrivals:
+            if not arrivals or not isinstance(arrivals, list):
                 return _default_signal_estimate()
 
-            # 지연 시간 추출
-            delays = []
-            for bus in arrivals:
-                expected = bus.get("expectedArrival", "")
-                scheduled = bus.get("scheduledArrival", "")
-                if expected and scheduled:
-                    try:
-                        exp_t = datetime.fromisoformat(expected.replace("Z", "+00:00"))
-                        sch_t = datetime.fromisoformat(scheduled.replace("Z", "+00:00"))
-                        delay = (exp_t - sch_t).total_seconds()
-                        # 양의 지연만 (신호 대기로 인한 지연)
-                        if 10 < delay < 120:
-                            delays.append(delay)
-                    except Exception:
-                        continue
+            from app.services.signal_prediction import calc_delay_detail
 
-            if not delays:
+            detail = calc_delay_detail(arrivals, get_london_now())
+            if detail["sample_count"] == 0:
                 return _default_signal_estimate()
 
-            avg_delay = sum(delays) / len(delays)
-            confidence = min(1.0, len(delays) / 5)  # 5개 이상이면 신뢰도 1.0
-
-            # 버스 지연 → 신호 사이클 추정
-            # 버스 지연의 약 70%가 신호 대기에서 발생한다고 가정
-            signal_wait = avg_delay * 0.7
-            # 신호 사이클 = 대기 * 2 (빨간 + 초록이 비슷한 비율이라고 가정)
+            avg_delay = detail["avg_delay_sec"]
+            signal_wait = abs(avg_delay) * 0.7
             cycle_estimate = signal_wait * 2.8
 
             return {
                 "estimated_wait_sec": round(signal_wait),
-                "cycle_sec": round(min(max(cycle_estimate, 45), 150)),  # 45~150초 범위 제한
-                "confidence": round(confidence, 2),
-                "sample_count": len(delays),
+                "cycle_sec": round(min(max(cycle_estimate, 45), 150)),
+                "confidence": detail["confidence"],
+                "sample_count": detail["sample_count"],
+                "delay_methods": detail.get("methods", []),
             }
 
         except Exception:

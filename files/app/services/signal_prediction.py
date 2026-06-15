@@ -77,26 +77,153 @@ def resolve_stop_name(stop: dict) -> str:
     return "Unknown Stop"
 
 
-def calc_delay_from_arrivals(arrivals: list[dict]) -> tuple[float, int]:
-    """Average bus delay (seconds) and sample count from arrival payloads."""
+def _parse_utc(ts: str | None) -> datetime | None:
+    if not ts:
+        return None
+    try:
+        return datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+
+
+def _prediction_sent_at(bus: dict) -> datetime | None:
+    timing = bus.get("timing") or {}
+    return _parse_utc(timing.get("sent") or timing.get("read") or bus.get("timestamp"))
+
+
+def calc_delay_from_arrivals(
+    arrivals: list[dict],
+    observed_at: datetime | None = None,
+) -> tuple[float, int]:
+    """
+    Estimate corridor delay / signal-hold proxy from TfL StopPoint/Arrivals.
+
+    TfL no longer returns scheduledArrival on most predictions. Methods used:
+      1) Legacy: expectedArrival − scheduledArrival (if both exist)
+      2) Drift: prediction age vs timeToStation mismatch (stale/hold)
+      3) Bunching: 2+ buses within 75s TTS gap → queue at signals
+    """
+    result = calc_delay_detail(arrivals, observed_at)
+    return result["avg_delay_sec"], result["sample_count"]
+
+
+def calc_delay_detail(
+    arrivals: list[dict],
+    observed_at: datetime | None = None,
+) -> dict[str, Any]:
+    """Full delay breakdown with confidence for logging and accuracy scoring."""
+    now = observed_at or datetime.now(LONDON_TZ)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=LONDON_TZ)
+    now_utc = now.astimezone(ZoneInfo("UTC"))
+
     delays: list[float] = []
-    for bus in arrivals:
-        if not isinstance(bus, dict):
-            continue
-        exp, sch = bus.get("expectedArrival"), bus.get("scheduledArrival")
+    methods: list[str] = []
+
+    valid = [b for b in arrivals if isinstance(b, dict)]
+
+    # Method 1 — legacy scheduled vs expected
+    for bus in valid:
+        exp, sch = bus.get("expectedArrival"), bus.get("scheduledArrival") or bus.get(
+            "scheduledArrivalTime"
+        )
         if not exp or not sch:
             continue
-        try:
-            exp_t = datetime.fromisoformat(str(exp).replace("Z", "+00:00"))
-            sch_t = datetime.fromisoformat(str(sch).replace("Z", "+00:00"))
-            delay = (exp_t - sch_t).total_seconds()
-            if -30 < delay < 300:
-                delays.append(delay)
-        except (ValueError, TypeError):
+        exp_t, sch_t = _parse_utc(exp), _parse_utc(sch)
+        if not exp_t or not sch_t:
             continue
+        delay = (exp_t - sch_t).total_seconds()
+        if -30 < delay < 300:
+            delays.append(delay)
+            methods.append("scheduled")
+
+    # Method 2 — prediction drift (recent predictions only)
+    for bus in valid:
+        tts = bus.get("timeToStation")
+        exp_t = _parse_utc(bus.get("expectedArrival"))
+        sent_t = _prediction_sent_at(bus)
+        if tts is None or exp_t is None or sent_t is None:
+            continue
+        if not (30 <= tts <= 600):
+            continue
+        age = (now_utc - sent_t.astimezone(ZoneInfo("UTC"))).total_seconds()
+        if age > 90 or age < 0:
+            continue
+        remaining = (exp_t - now_utc).total_seconds()
+        drift = remaining - tts
+        if 8 < drift < 180:
+            delays.append(drift)
+            methods.append("drift")
+        elif drift <= -15:
+            # Bus ahead of countdown — slight negative, treat as minimal delay
+            delays.append(max(0.0, 5 + drift * 0.3))
+            methods.append("drift_early")
+
+    # Method 3 — bus bunching near stop (signal queue proxy)
+    near = [
+        b for b in valid
+        if b.get("timeToStation") is not None and 45 <= b["timeToStation"] <= 420
+    ]
+    if len(near) >= 2:
+        tts_sorted = sorted(b["timeToStation"] for b in near)
+        min_gap = min(tts_sorted[i + 1] - tts_sorted[i] for i in range(len(tts_sorted) - 1))
+        if min_gap < 75:
+            bunch_delay = min(90.0, max(12.0, 75 - min_gap + 10))
+            delays.append(bunch_delay)
+            methods.append("bunching")
+
+    # Method 4 — lead bus moderate TTS with low movement (single-bus hold hint)
     if not delays:
-        return 0.0, 0
-    return sum(delays) / len(delays), len(delays)
+        imminent = [b for b in valid if b.get("timeToStation") is not None and 90 <= b["timeToStation"] <= 240]
+        if imminent:
+            lead_tts = min(b["timeToStation"] for b in imminent)
+            hold_proxy = max(0.0, min(45.0, (lead_tts - 90) * 0.35))
+            if hold_proxy >= 10:
+                delays.append(hold_proxy)
+                methods.append("lead_hold")
+
+    if not delays:
+        return {
+            "avg_delay_sec": 0.0,
+            "sample_count": 0,
+            "confidence": 0.1,
+            "methods": [],
+            "bus_count": len(valid),
+        }
+
+    avg = sum(delays) / len(delays)
+    confidence = estimate_delay_confidence(len(delays), methods, len(valid))
+
+    return {
+        "avg_delay_sec": round(avg, 1),
+        "sample_count": len(delays),
+        "confidence": confidence,
+        "methods": methods,
+        "bus_count": len(valid),
+    }
+
+
+def estimate_delay_confidence(sample_count: int, methods: list[str], bus_count: int) -> float:
+    """
+    Heuristic confidence (0–1) for delay estimate quality.
+    Calibrated against TfL proxy limitations (no C-ITS ground truth).
+    """
+    base = min(0.55, 0.15 + sample_count * 0.08)
+    if "scheduled" in methods:
+        base += 0.25
+    if "bunching" in methods:
+        base += 0.12
+    if "drift" in methods:
+        base += 0.10
+    if bus_count >= 3:
+        base += 0.05
+    return round(min(0.85, base), 2)
+
+
+def estimate_system_accuracy() -> dict[str, Any]:
+    """Legacy wrapper — delegates to free-tier fusion accuracy doc."""
+    from app.services.fusion_service import estimate_free_tier_accuracy
+    return estimate_free_tier_accuracy()
 
 
 def _road_roi(gray: np.ndarray) -> np.ndarray:
@@ -122,22 +249,27 @@ def infer_pedestrian_color_from_jamcam_frames(
     frame_a: np.ndarray, frame_b: np.ndarray | None = None
 ) -> tuple[str, float]:
     """
-    H: Infer pedestrian signal colour from JamCam road imagery.
-
-    Logic (UK junctions):
-      - Cars stopped / queued  → vehicular RED  → pedestrian GREEN
-      - Cars moving through    → vehicular GREEN → pedestrian RED
+    H: Infer pedestrian signal from JamCam (free CV — motion + queue variance).
+    Queued/stopped traffic → pedestrian GREEN; flowing traffic → pedestrian RED.
     """
-    if frame_b is not None:
-        movement = _movement_score(frame_a, frame_b)
-    else:
-        roi = _road_roi(frame_a).astype(np.float32)
-        movement = float(np.clip(roi.std() / 40.0, 0.0, 1.0))
+    move = _movement_score(frame_a, frame_b) if frame_b is not None else 0.5
 
-    if movement >= 0.55:
-        return "RED", min(0.85, 0.45 + movement * 0.4)
-    if movement <= 0.30:
-        return "GREEN", min(0.85, 0.45 + (1.0 - movement) * 0.4)
+    roi = _road_roi(frame_a)
+    static_score = 1.0 - float(np.clip(roi.std() / 42.0, 0.0, 1.0))
+
+    if frame_b is not None:
+        roi_b = _road_roi(frame_b)
+        edge_motion = float(
+            np.abs(roi.astype(np.float32) - roi_b.astype(np.float32)).mean() / 22.0
+        )
+        move = max(move, min(1.0, edge_motion))
+
+    queue_score = (1.0 - move) * 0.6 + static_score * 0.4
+
+    if queue_score >= 0.58:
+        return "GREEN", round(min(0.88, 0.55 + queue_score * 0.35), 2)
+    if move >= 0.52:
+        return "RED", round(min(0.85, 0.5 + move * 0.35), 2)
     return "AMBER", 0.45
 
 

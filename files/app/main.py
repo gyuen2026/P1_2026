@@ -3,17 +3,44 @@ import asyncio
 
 from app.api.routes import router as routes_router
 from app.api.sessions import router as sessions_router
+from app.api.signals import router as signals_router
 from app.services import route_service, signal_collector
 
-app = FastAPI(title="London Runner API", version="2.0")
+app = FastAPI(title="London Runner API", version="2.1")
 
 app.include_router(routes_router)
 app.include_router(sessions_router)
+app.include_router(signals_router)
 
 
 @app.on_event("startup")
 async def startup():
-    asyncio.create_task(signal_collector.run_scheduler(interval_minutes=30))
+    from app.services.osm_crossings import ensure_crossings_loaded
+    asyncio.create_task(signal_collector.run_scheduler(interval_minutes=90))
+    asyncio.create_task(ensure_crossings_loaded())
+
+
+@app.get("/collector/accuracy")
+async def collector_accuracy():
+    """Free-tier accuracy tiers (matches paid traffic-API fusion target)."""
+    from app.services.fusion_service import estimate_free_tier_accuracy
+    return estimate_free_tier_accuracy()
+
+
+@app.get("/collector/status")
+async def collector_status():
+    """Check if background collection is running and when it last finished."""
+    return signal_collector.get_collection_status()
+
+
+@app.post("/collector/run")
+async def collector_run():
+    """
+    Manually start one collection cycle.
+    Use with an external cron (e.g. cron-job.org every 10 min) to keep Render awake.
+    """
+    asyncio.create_task(signal_collector.trigger_collection())
+    return {"status": "started", **signal_collector.get_collection_status()}
 
 
 @app.get("/")
