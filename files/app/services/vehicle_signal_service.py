@@ -13,11 +13,17 @@ _cycle_vehicles: list[dict] | None = None
 
 
 async def load_bus_positions_for_cycle() -> list[dict]:
-    """Fetch all London bus positions in one TfL call (~1 req/cycle)."""
+    """
+    Fetch bus GPS for the cycle. TfL /Vehicle/VehiclePositions often 404 on
+    standard keys — returns [] gracefully; per-stop Arrivals still power fusion.
+    """
     global _cycle_vehicles
-    data = await tfl_service.get_tfl_data("/Vehicle/VehiclePositions/bus", timeout=90)
-    if not isinstance(data, list):
-        _cycle_vehicles = []
+    _cycle_vehicles = []
+    for endpoint in ("/Vehicle/VehiclePositions/bus", "/Vehicle/VehiclePositions/Bus"):
+        data = await tfl_service.get_tfl_data(endpoint, timeout=30)
+        if isinstance(data, list) and data:
+            break
+    else:
         return _cycle_vehicles
 
     vehicles = []
