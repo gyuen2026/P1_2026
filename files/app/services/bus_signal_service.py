@@ -5,6 +5,7 @@
   버스 예정 도착시간 vs 실제 도착시간의 차이 = 신호 대기 시간
   이 패턴을 누적하면 신호 사이클을 역추적 가능
 """
+import asyncio
 import httpx
 import math
 from datetime import datetime
@@ -207,7 +208,7 @@ async def calc_route_red_probability(
     time_weight = get_time_weight(hour)
 
     # 경로 위 버스 정류장 = 신호등 위치 프록시
-    stops = await get_stops_near_path(waypoints)
+    stops = (await get_stops_near_path(waypoints))[:6]
 
     if not stops:
         # 정류장 없으면 기본값
@@ -219,30 +220,30 @@ async def calc_route_red_probability(
             "stop_count": 0,
         }
 
-    total_distance_km = 0.0
-    red_stops = 0
-    total_wait = 0.0
-    green_probs = []
+    path_sample = waypoints[:: max(1, len(waypoints) // 40)] or waypoints
 
-    for i, stop in enumerate(stops):
-        # Distance from nearest point on the path (not just start)
-        sample = waypoints[:: max(1, len(waypoints) // 40)] or waypoints
+    async def _score_stop(stop: dict) -> tuple[float, float, dict]:
         dist_to_stop = min(
             _haversine_km(wp["lat"], wp["lon"], stop["lat"], stop["lon"])
-            for wp in sample
+            for wp in path_sample
         )
         arrival_sec = dist_to_stop * pace_min_per_km * 60
-
-        # 버스 지연 데이터로 신호 추정
         signal_data = await get_signal_wait_estimate(stop["id"])
         cycle = signal_data["cycle_sec"] * time_weight
         wait = signal_data["estimated_wait_sec"] * time_weight
-
-        # 초록불 확률 계산
         green_prob = calc_green_probability(arrival_sec, cycle)
-        green_probs.append(green_prob)
+        return green_prob, wait, signal_data
 
-        # 빨간불이면 대기 추가
+    stop_results = await asyncio.gather(*[_score_stop(s) for s in stops])
+
+    red_stops = 0
+    total_wait = 0.0
+    green_probs = []
+    signal_data: dict = {}
+
+    for green_prob, wait, sig in stop_results:
+        signal_data = sig
+        green_probs.append(green_prob)
         if green_prob < 0.5:
             red_stops += 1
             total_wait += wait

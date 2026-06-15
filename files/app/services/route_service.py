@@ -1,3 +1,4 @@
+import asyncio
 import math
 import uuid
 
@@ -152,6 +153,16 @@ def _move_meters(lat: float, lon: float, bearing_deg: float, distance_m: float) 
     return lat + dlat, lon + dlon
 
 
+def _simplify_waypoints(waypoints: list[dict], max_points: int = 60) -> list[dict]:
+    if len(waypoints) <= max_points:
+        return waypoints
+    step = max(1, len(waypoints) // max_points)
+    slim = waypoints[::step]
+    if slim[-1] != waypoints[-1]:
+        slim.append(waypoints[-1])
+    return slim
+
+
 def _route_signature(waypoints: list[dict]) -> tuple[tuple[float, float], ...]:
     if len(waypoints) < 2:
         return ()
@@ -175,8 +186,9 @@ async def _score_waypoints(
     distance_km = path_distance_km(waypoints)
     est_duration = duration_min if duration_min is not None else round(distance_km * pace_min_per_km, 1)
 
-    signal_stats = await calc_route_red_probability(waypoints, pace_min_per_km, get_london_now())
-    disrupt_pen = await _disruption_penalty_for_path(waypoints, disruptions)
+    slim = _simplify_waypoints(waypoints, max_points=80)
+    signal_stats = await calc_route_red_probability(slim, pace_min_per_km, get_london_now())
+    disrupt_pen = await _disruption_penalty_for_path(slim, disruptions)
     score = compute_runner_score(
         turns=turns,
         green_wave_score=signal_stats["green_wave_score"],
@@ -197,8 +209,8 @@ async def _score_waypoints(
         "score": score,
         "turns": turns,
         "green_wave_score": signal_stats["green_wave_score"],
-        "polyline": [{"lat": w["lat"], "lon": w["lon"]} for w in waypoints],
-        "waypoints": waypoints,
+        "polyline": [{"lat": w["lat"], "lon": w["lon"]} for w in slim],
+        "waypoints": slim,
         "description": "",
         "status": "clear" if disrupt_pen < 0.3 else "disrupted",
     }
@@ -213,29 +225,40 @@ async def _generate_via_alternatives(
     existing_sigs: set[tuple[tuple[float, float], ...]],
     max_routes: int,
 ) -> list[tuple[list[dict], float]]:
-    """Build extra walking paths by routing through offset via-points."""
+    """Build extra walking paths through offset via-points (parallel TfL calls)."""
     results: list[tuple[list[dict], float]] = []
     base_bearing = _bearing_deg(start_lat, start_lon, end_lat, end_lon)
     side_bearings = ((base_bearing + 90) % 360, (base_bearing - 90) % 360)
 
-    for fraction in (0.35, 0.5, 0.65):
+    via_jobs: list[tuple[float, float]] = []
+    for fraction in (0.4, 0.55):
         mid_lat, mid_lon = _interpolate(start_lat, start_lon, end_lat, end_lon, fraction)
-        for offset_m in (200, 350, 500):
+        for offset_m in (250, 400):
             for side_bearing in side_bearings:
-                if len(results) >= max_routes:
-                    return results
-                via_lat, via_lon = _move_meters(mid_lat, mid_lon, side_bearing, offset_m)
-                chained = await tfl_service.chain_walking_journey(
-                    start_lat, start_lon, via_lat, via_lon, end_lat, end_lon,
-                )
-                if not chained:
-                    continue
-                waypoints, duration = chained
-                sig = _route_signature(waypoints)
-                if sig in existing_sigs:
-                    continue
-                existing_sigs.add(sig)
-                results.append((waypoints, duration))
+                via_jobs.append(_move_meters(mid_lat, mid_lon, side_bearing, offset_m))
+
+    async def _try_via(via: tuple[float, float]):
+        return await tfl_service.chain_walking_journey(
+            start_lat, start_lon, via[0], via[1], end_lat, end_lon,
+        )
+
+    batch_size = 4
+    for i in range(0, len(via_jobs), batch_size):
+        if len(results) >= max_routes:
+            break
+        batch = via_jobs[i : i + batch_size]
+        outcomes = await asyncio.gather(*[_try_via(v) for v in batch], return_exceptions=True)
+        for chained in outcomes:
+            if len(results) >= max_routes:
+                break
+            if not chained or isinstance(chained, Exception):
+                continue
+            waypoints, duration = chained
+            sig = _route_signature(waypoints)
+            if sig in existing_sigs:
+                continue
+            existing_sigs.add(sig)
+            results.append((waypoints, duration))
     return results
 
 
@@ -282,18 +305,21 @@ async def recommend_routes(
         )
         raw_candidates.extend(extras)
 
-    scored_routes = []
-    for idx, (waypoints, duration) in enumerate(raw_candidates[:8]):
-        route = await _score_waypoints(
-            waypoints,
-            disruptions=disruptions,
-            pace_min_per_km=pace_min_per_km,
-            target_km=_target_km,
-            duration_min=duration,
-            route_index=idx,
-        )
-        if route:
-            scored_routes.append(route)
+    candidates = raw_candidates[:5]
+    scored = await asyncio.gather(
+        *[
+            _score_waypoints(
+                wps,
+                disruptions=disruptions,
+                pace_min_per_km=pace_min_per_km,
+                target_km=_target_km,
+                duration_min=dur,
+                route_index=i,
+            )
+            for i, (wps, dur) in enumerate(candidates)
+        ]
+    )
+    scored_routes = [r for r in scored if r]
 
     return _assign_route_rankings(scored_routes)[:5]
 
