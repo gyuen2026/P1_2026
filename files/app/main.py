@@ -1,4 +1,5 @@
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 import asyncio
 
 from app.api.routes import router as routes_router
@@ -7,6 +8,14 @@ from app.api.signals import router as signals_router
 from app.services import route_service, signal_collector
 
 app = FastAPI(title="London Runner API", version="2.1")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 app.include_router(routes_router)
 app.include_router(sessions_router)

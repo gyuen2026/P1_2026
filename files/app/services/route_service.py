@@ -4,6 +4,7 @@ import uuid
 from app.services import tfl_service
 from app.services.bus_signal_service import calc_route_red_probability
 from app.services.fusion_service import predict_signal_at_location
+from app.services.signal_prediction import get_london_now, _haversine_km
 
 
 def calculate_turns(waypoints: list[dict]) -> int:
