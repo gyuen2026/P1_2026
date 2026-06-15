@@ -147,7 +147,14 @@ async def process_and_save_stop(
         db.table("bus_signal_observations").insert(record).execute()
         return True
     except Exception as exc:
+        err = str(exc)
         print(f"  ⚠️ Insert failed for {stop_id}: {exc}", flush=True)
+        if "42501" in err or "row-level security" in err.lower():
+            print(
+                "  → Fix: Supabase SQL Editor → run supabase_fix_rls.sql "
+                "AND set SUPABASE_KEY=service_role in .env",
+                flush=True,
+            )
         return False
 
 
