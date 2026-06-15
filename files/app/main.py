@@ -16,6 +16,8 @@ app.include_router(signals_router)
 @app.on_event("startup")
 async def startup():
     from app.services.osm_crossings import ensure_crossings_loaded
+    # Background collector: runs every 90 min, parallel with user API requests.
+    # For 30-day 24/7 collection, also run scripts/start_month_collector.sh locally.
     asyncio.create_task(signal_collector.run_scheduler(interval_minutes=90))
     asyncio.create_task(ensure_crossings_loaded())
 
@@ -45,7 +47,13 @@ async def collector_run():
 
 @app.get("/")
 async def root():
-    return {"status": "global_tracking_active", "zones": "1-2", "radius_km": 7.5}
+    return {
+        "status": "global_tracking_active",
+        "zones": "1-2",
+        "radius_km": 7.5,
+        "collector_interval_min": 90,
+        "collector": signal_collector.get_collection_status(),
+    }
 
 
 @app.get("/routes/recommend")
