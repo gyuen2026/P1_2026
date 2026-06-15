@@ -59,6 +59,108 @@ async def _disruption_penalty_for_path(waypoints: list[dict], disruptions: list[
     return min(1.0, hits / max(1, len(sample)))
 
 
+def _bearing_deg(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    return math.degrees(math.atan2(lon2 - lon1, lat2 - lat1)) % 360
+
+
+def _interpolate(lat1: float, lon1: float, lat2: float, lon2: float, fraction: float) -> tuple[float, float]:
+    f = max(0.0, min(1.0, fraction))
+    return lat1 + (lat2 - lat1) * f, lon1 + (lon2 - lon1) * f
+
+
+def _move_meters(lat: float, lon: float, bearing_deg: float, distance_m: float) -> tuple[float, float]:
+    """Approximate offset — accurate enough for London via-points."""
+    br = math.radians(bearing_deg)
+    dlat = (distance_m * math.cos(br)) / 111_320
+    dlon = (distance_m * math.sin(br)) / (111_320 * math.cos(math.radians(lat)))
+    return lat + dlat, lon + dlon
+
+
+def _route_signature(waypoints: list[dict]) -> tuple[tuple[float, float], ...]:
+    if len(waypoints) < 2:
+        return ()
+    picks = [waypoints[0], waypoints[len(waypoints) // 2], waypoints[-1]]
+    return tuple((round(p["lat"], 3), round(p["lon"], 3)) for p in picks)
+
+
+async def _score_waypoints(
+    waypoints: list[dict],
+    *,
+    disruptions: list[dict],
+    pace_min_per_km: float,
+    target_km: float,
+    duration_min: float | None,
+    route_index: int,
+) -> dict | None:
+    if len(waypoints) < 2:
+        return None
+
+    turns = calculate_turns(waypoints)
+    distance_km = path_distance_km(waypoints)
+    est_duration = duration_min if duration_min is not None else round(distance_km * pace_min_per_km, 1)
+
+    signal_stats = await calc_route_red_probability(waypoints, pace_min_per_km, get_london_now())
+    disrupt_pen = await _disruption_penalty_for_path(waypoints, disruptions)
+    score = score_route(turns, signal_stats["green_wave_score"], disrupt_pen)
+
+    labels = ["Fastest", "Green Wave", "Scenic", "Quiet", "Alternate"]
+    name = labels[route_index] if route_index < len(labels) else f"Route {route_index + 1}"
+
+    return {
+        "route_id": str(uuid.uuid4()),
+        "name": name,
+        "distance_km": distance_km or target_km,
+        "estimated_duration_min": round(est_duration, 1),
+        "signal_stops": signal_stats["expected_red_stops"],
+        "signal_wait_total_sec": signal_stats["total_wait_sec"],
+        "score": score,
+        "turns": turns,
+        "green_wave_score": signal_stats["green_wave_score"],
+        "polyline": [{"lat": w["lat"], "lon": w["lon"]} for w in waypoints],
+        "waypoints": waypoints,
+        "description": (
+            f"{turns} turns · {signal_stats['green_wave_score']}% green-wave · "
+            f"~{signal_stats['expected_red_stops']} signal stops"
+        ),
+        "status": "clear" if disrupt_pen < 0.3 else "disrupted",
+    }
+
+
+async def _generate_via_alternatives(
+    start_lat: float,
+    start_lon: float,
+    end_lat: float,
+    end_lon: float,
+    *,
+    existing_sigs: set[tuple[tuple[float, float], ...]],
+    max_routes: int,
+) -> list[tuple[list[dict], float]]:
+    """Build extra walking paths by routing through offset via-points."""
+    results: list[tuple[list[dict], float]] = []
+    base_bearing = _bearing_deg(start_lat, start_lon, end_lat, end_lon)
+    side_bearings = ((base_bearing + 90) % 360, (base_bearing - 90) % 360)
+
+    for fraction in (0.35, 0.5, 0.65):
+        mid_lat, mid_lon = _interpolate(start_lat, start_lon, end_lat, end_lon, fraction)
+        for offset_m in (200, 350, 500):
+            for side_bearing in side_bearings:
+                if len(results) >= max_routes:
+                    return results
+                via_lat, via_lon = _move_meters(mid_lat, mid_lon, side_bearing, offset_m)
+                chained = await tfl_service.chain_walking_journey(
+                    start_lat, start_lon, via_lat, via_lon, end_lat, end_lon,
+                )
+                if not chained:
+                    continue
+                waypoints, duration = chained
+                sig = _route_signature(waypoints)
+                if sig in existing_sigs:
+                    continue
+                existing_sigs.add(sig)
+                results.append((waypoints, duration))
+    return results
+
+
 async def recommend_routes(
     start_lat: float,
     start_lon: float,
@@ -82,40 +184,42 @@ async def recommend_routes(
     if not journey_data or not journey_data.get("journeys"):
         return []
 
-    scored_routes = []
-    for idx, journey in enumerate(journey_data.get("journeys", [])[:5]):
+    seen_sigs: set[tuple[tuple[float, float], ...]] = set()
+    raw_candidates: list[tuple[list[dict], float | None]] = []
+
+    for journey in journey_data.get("journeys", [])[:5]:
         waypoints = tfl_service.extract_waypoints_from_journey(journey)
-        if len(waypoints) < 2:
+        sig = _route_signature(waypoints)
+        if len(waypoints) < 2 or sig in seen_sigs:
             continue
+        seen_sigs.add(sig)
+        duration = float(journey["duration"]) if journey.get("duration") is not None else None
+        raw_candidates.append((waypoints, duration))
 
-        turns = calculate_turns(waypoints)
-        distance_km = path_distance_km(waypoints)
-        duration_min = round((journey.get("duration") or distance_km * pace_min_per_km * 60) / 60, 1)
+    if len(raw_candidates) < 5:
+        extras = await _generate_via_alternatives(
+            start_lat, start_lon, end_lat, end_lon,
+            existing_sigs=seen_sigs,
+            max_routes=5 - len(raw_candidates),
+        )
+        raw_candidates.extend(extras)
 
-        signal_stats = await calc_route_red_probability(waypoints, pace_min_per_km, get_london_now())
-        disrupt_pen = await _disruption_penalty_for_path(waypoints, disruptions)
-        score = score_route(turns, signal_stats["green_wave_score"], disrupt_pen)
-
-        scored_routes.append({
-            "route_id": str(uuid.uuid4()),
-            "name": f"Route {idx + 1}",
-            "distance_km": distance_km or _target_km,
-            "estimated_duration_min": duration_min,
-            "signal_stops": signal_stats["expected_red_stops"],
-            "signal_wait_total_sec": signal_stats["total_wait_sec"],
-            "score": score,
-            "turns": turns,
-            "green_wave_score": signal_stats["green_wave_score"],
-            "polyline": [{"lat": w["lat"], "lon": w["lon"]} for w in waypoints],
-            "waypoints": waypoints,
-            "description": (
-                f"{turns} turns · {signal_stats['green_wave_score']}% green-wave · "
-                f"~{signal_stats['expected_red_stops']} signal stops"
-            ),
-            "status": "clear" if disrupt_pen < 0.3 else "disrupted",
-        })
+    scored_routes = []
+    for idx, (waypoints, duration) in enumerate(raw_candidates[:5]):
+        route = await _score_waypoints(
+            waypoints,
+            disruptions=disruptions,
+            pace_min_per_km=pace_min_per_km,
+            target_km=_target_km,
+            duration_min=duration,
+            route_index=idx,
+        )
+        if route:
+            scored_routes.append(route)
 
     scored_routes.sort(key=lambda r: r["score"], reverse=True)
+    for i, route in enumerate(scored_routes):
+        route["name"] = ["Fastest", "Green Wave", "Scenic", "Quiet", "Alternate"][i] if i < 5 else f"Route {i + 1}"
     return scored_routes[:5]
 
 

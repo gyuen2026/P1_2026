@@ -166,6 +166,37 @@ async def get_journey_options(start_lat: float, start_lon: float, end_lat: float
     return {}
 
 
+async def chain_walking_journey(
+    start_lat: float,
+    start_lon: float,
+    via_lat: float,
+    via_lon: float,
+    end_lat: float,
+    end_lon: float,
+) -> tuple[list[dict], float] | None:
+    """Start → via → end walking path (TfL rarely returns >2 direct alternatives)."""
+    leg1 = await get_journey_options(start_lat, start_lon, via_lat, via_lon)
+    leg2 = await get_journey_options(via_lat, via_lon, end_lat, end_lon)
+    j1 = (leg1.get("journeys") or [None])[0]
+    j2 = (leg2.get("journeys") or [None])[0]
+    if not j1 or not j2:
+        return None
+
+    waypoints: list[dict] = []
+    for journey in (j1, j2):
+        waypoints.extend(extract_waypoints_from_journey(journey))
+
+    deduped: list[dict] = []
+    for wp in waypoints:
+        if not deduped or deduped[-1] != wp:
+            deduped.append(wp)
+    if len(deduped) < 2:
+        return None
+
+    duration = float(j1.get("duration") or 0) + float(j2.get("duration") or 0)
+    return deduped, duration
+
+
 def decode_line_string(line_string: str) -> list[dict]:
     """Decode TfL GeoJSON lineString (lon lat pairs) into waypoint dicts."""
     if not line_string:
