@@ -23,7 +23,7 @@ python3 -m pip install -q -r requirements.txt
 python3 <<'PY'
 import os, sys
 from dotenv import load_dotenv
-load_dotenv()
+load_dotenv(".env")
 required = ["TFL_APP_KEY", "SUPABASE_URL", "SUPABASE_KEY"]
 missing = [k for k in required if not os.getenv(k) or "your_" in os.getenv(k, "")]
 if missing:
@@ -41,7 +41,7 @@ python3 <<'PY'
 import asyncio, os, sys
 from datetime import datetime
 from dotenv import load_dotenv
-load_dotenv()
+load_dotenv(".env")
 from supabase import create_client
 
 url, key = os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"]
