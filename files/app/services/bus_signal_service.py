@@ -225,10 +225,11 @@ async def calc_route_red_probability(
     green_probs = []
 
     for i, stop in enumerate(stops):
-        # 이 정류장까지 러너 도착 예상 시간
-        dist_to_stop = _haversine_km(
-            waypoints[0]["lat"], waypoints[0]["lon"],
-            stop["lat"], stop["lon"]
+        # Distance from nearest point on the path (not just start)
+        sample = waypoints[:: max(1, len(waypoints) // 40)] or waypoints
+        dist_to_stop = min(
+            _haversine_km(wp["lat"], wp["lon"], stop["lat"], stop["lon"])
+            for wp in sample
         )
         arrival_sec = dist_to_stop * pace_min_per_km * 60
 

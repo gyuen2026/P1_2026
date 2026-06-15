@@ -1,3 +1,5 @@
+import json
+
 import asyncio
 import traceback
 
@@ -198,11 +200,27 @@ async def chain_walking_journey(
 
 
 def decode_line_string(line_string: str) -> list[dict]:
-    """Decode TfL GeoJSON lineString (lon lat pairs) into waypoint dicts."""
+    """Decode TfL path lineString into waypoint dicts."""
     if not line_string:
         return []
+
+    stripped = line_string.strip()
+
+    # TfL walking paths: JSON array [[lat, lon], ...]
+    if stripped.startswith("["):
+        try:
+            coords = json.loads(stripped)
+            waypoints = []
+            for pair in coords:
+                if isinstance(pair, (list, tuple)) and len(pair) >= 2:
+                    waypoints.append({"lat": float(pair[0]), "lon": float(pair[1])})
+            return waypoints
+        except (json.JSONDecodeError, TypeError, ValueError):
+            pass
+
+    # GeoJSON-style: space-separated lon lat pairs
     waypoints = []
-    parts = line_string.strip().split()
+    parts = stripped.split()
     for i in range(0, len(parts) - 1, 2):
         try:
             lon, lat = float(parts[i]), float(parts[i + 1])

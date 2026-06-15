@@ -7,19 +7,93 @@ from app.services.fusion_service import predict_signal_at_location
 from app.services.signal_prediction import get_london_now, _haversine_km
 
 
-def calculate_turns(waypoints: list[dict]) -> int:
-    """E: Count direction changes > 45° along the path."""
-    turns = 0
+def calculate_turns(waypoints: list[dict], angle_threshold: float = 28.0) -> int:
+    """E: Count meaningful direction changes along the path."""
     if len(waypoints) < 3:
         return 0
-    for i in range(1, len(waypoints) - 1):
-        p1, p2, p3 = waypoints[i - 1], waypoints[i], waypoints[i + 1]
-        b1 = math.atan2(p2["lon"] - p1["lon"], p2["lat"] - p1["lat"])
-        b2 = math.atan2(p3["lon"] - p2["lon"], p3["lat"] - p2["lat"])
-        angle = abs(math.degrees(b2 - b1))
-        if angle > 45:
-            turns += 1
+    turns = 0
+    prev_bearing: float | None = None
+    for i in range(1, len(waypoints)):
+        p1, p2 = waypoints[i - 1], waypoints[i]
+        seg_m = _haversine_km(p1["lat"], p1["lon"], p2["lat"], p2["lon"]) * 1000
+        if seg_m < 15:
+            continue
+        bearing = _bearing_deg(p1["lat"], p1["lon"], p2["lat"], p2["lon"])
+        if prev_bearing is not None:
+            delta = abs(bearing - prev_bearing)
+            if delta > 180:
+                delta = 360 - delta
+            if delta >= angle_threshold:
+                turns += 1
+        prev_bearing = bearing
     return turns
+
+
+def compute_runner_score(
+    *,
+    turns: int,
+    green_wave_score: float,
+    signal_stops: int,
+    signal_wait_sec: int,
+    disruption_penalty: float,
+) -> float:
+    """0–99 composite; spread scores so ranks are meaningful."""
+    score = (
+        88
+        - turns * 5
+        - signal_stops * 10
+        - min(signal_wait_sec / 30, 15)
+        + green_wave_score * 0.25
+        - disruption_penalty * 18
+    )
+    return round(max(12, min(99, score)), 1)
+
+
+def _assign_route_rankings(routes: list[dict]) -> list[dict]:
+    """Sort by score and attach rank + descriptive names."""
+    routes.sort(
+        key=lambda r: (
+            r["score"],
+            -r["signal_stops"],
+            -r["green_wave_score"],
+            -r["turns"],
+        ),
+        reverse=True,
+    )
+
+    if not routes:
+        return routes
+
+    fastest = min(routes, key=lambda r: r["estimated_duration_min"])
+    greenest = min(routes, key=lambda r: (r["signal_stops"], -r["green_wave_score"]))
+    straightest = min(routes, key=lambda r: (r["turns"], r["distance_km"]))
+
+    for i, route in enumerate(routes):
+        route["rank"] = i + 1
+        tags: list[str] = []
+        if route is fastest:
+            tags.append("Fastest")
+        if route is greenest:
+            tags.append("Fewest signals")
+        if route is straightest and route["turns"] == straightest["turns"]:
+            tags.append("Straightest")
+
+        if i == 0:
+            route["name"] = "Recommended"
+            route["badge"] = "BEST MATCH"
+        elif tags:
+            route["name"] = " · ".join(tags)
+            route["badge"] = f"#{i + 1}"
+        else:
+            route["name"] = f"Option {i + 1}"
+            route["badge"] = f"#{i + 1}"
+
+        route["description"] = (
+            f"{route['turns']} turns · {route['green_wave_score']}% green · "
+            f"~{route['signal_stops']} signal stops · "
+            f"{route['signal_wait_total_sec']}s wait"
+        )
+    return routes
 
 
 def path_distance_km(waypoints: list[dict]) -> float:
@@ -35,12 +109,14 @@ def path_distance_km(waypoints: list[dict]) -> float:
 
 
 def score_route(turns: int, green_wave_score: float, disruption_penalty: float) -> float:
-    """Composite score: straighter paths + greener signals − disruptions."""
-    turn_penalty = turns * 4
-    base = 100 - turn_penalty
-    signal_bonus = green_wave_score * 0.4
-    penalty = disruption_penalty * 25
-    return round(max(0, min(100, base + signal_bonus - penalty)), 1)
+    """Legacy alias — prefer compute_runner_score."""
+    return compute_runner_score(
+        turns=turns,
+        green_wave_score=green_wave_score,
+        signal_stops=0,
+        signal_wait_sec=0,
+        disruption_penalty=disruption_penalty,
+    )
 
 
 async def _disruption_penalty_for_path(waypoints: list[dict], disruptions: list[dict]) -> float:
@@ -101,14 +177,19 @@ async def _score_waypoints(
 
     signal_stats = await calc_route_red_probability(waypoints, pace_min_per_km, get_london_now())
     disrupt_pen = await _disruption_penalty_for_path(waypoints, disruptions)
-    score = score_route(turns, signal_stats["green_wave_score"], disrupt_pen)
-
-    labels = ["Fastest", "Green Wave", "Scenic", "Quiet", "Alternate"]
-    name = labels[route_index] if route_index < len(labels) else f"Route {route_index + 1}"
+    score = compute_runner_score(
+        turns=turns,
+        green_wave_score=signal_stats["green_wave_score"],
+        signal_stops=signal_stats["expected_red_stops"],
+        signal_wait_sec=signal_stats["total_wait_sec"],
+        disruption_penalty=disrupt_pen,
+    )
 
     return {
         "route_id": str(uuid.uuid4()),
-        "name": name,
+        "name": "Route",
+        "badge": "",
+        "rank": 0,
         "distance_km": distance_km or target_km,
         "estimated_duration_min": round(est_duration, 1),
         "signal_stops": signal_stats["expected_red_stops"],
@@ -118,10 +199,7 @@ async def _score_waypoints(
         "green_wave_score": signal_stats["green_wave_score"],
         "polyline": [{"lat": w["lat"], "lon": w["lon"]} for w in waypoints],
         "waypoints": waypoints,
-        "description": (
-            f"{turns} turns · {signal_stats['green_wave_score']}% green-wave · "
-            f"~{signal_stats['expected_red_stops']} signal stops"
-        ),
+        "description": "",
         "status": "clear" if disrupt_pen < 0.3 else "disrupted",
     }
 
@@ -205,7 +283,7 @@ async def recommend_routes(
         raw_candidates.extend(extras)
 
     scored_routes = []
-    for idx, (waypoints, duration) in enumerate(raw_candidates[:5]):
+    for idx, (waypoints, duration) in enumerate(raw_candidates[:8]):
         route = await _score_waypoints(
             waypoints,
             disruptions=disruptions,
@@ -217,10 +295,7 @@ async def recommend_routes(
         if route:
             scored_routes.append(route)
 
-    scored_routes.sort(key=lambda r: r["score"], reverse=True)
-    for i, route in enumerate(scored_routes):
-        route["name"] = ["Fastest", "Green Wave", "Scenic", "Quiet", "Alternate"][i] if i < 5 else f"Route {i + 1}"
-    return scored_routes[:5]
+    return _assign_route_rankings(scored_routes)[:5]
 
 
 def _nearest_disruption(user_lat: float, user_lon: float, disruptions: list[dict]) -> dict | None:
