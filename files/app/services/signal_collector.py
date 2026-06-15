@@ -8,7 +8,11 @@ from app.core.config import settings
 from app.services import tfl_service
 from app.services.tfl_service import parse_stops_payload
 from app.services.fusion_service import predict_signal_fused
-from app.services.osm_crossings import ensure_crossings_loaded, is_near_traffic_signal
+from app.services.osm_crossings import (
+    ensure_crossings_loaded,
+    filter_stops_at_signals,
+    is_near_traffic_signal,
+)
 from app.services.signal_prediction import (
     build_observation_record,
     calc_delay_detail,
@@ -76,7 +80,7 @@ async def process_and_save_stop(
     if not is_valid_london_coord(lat, lon):
         return False
 
-    if signal_only and osm_crossings is not None:
+    if signal_only and osm_crossings:
         if not is_near_traffic_signal(lat, lon, osm_crossings):
             return False
 
@@ -214,13 +218,29 @@ async def run_global_collection(stop_limit: int | None = None):
         return
 
     stops = parse_stops_payload(stops_data)
+    use_signal_filter = bool(osm_crossings)
 
     if stop_limit:
-        stops = stops[:stop_limit]
-        print(f"🔎 Smoke test: limited to {len(stops)} stops", flush=True)
+        if use_signal_filter:
+            stops = filter_stops_at_signals(stops, osm_crossings, limit=stop_limit)
+            print(
+                f"🔎 Smoke test: {len(stops)} signal-near stops (OSM geofence)",
+                flush=True,
+            )
+        else:
+            stops = stops[:stop_limit]
+            print(
+                f"🔎 Smoke test: first {len(stops)} stops (no OSM — geofence off)",
+                flush=True,
+            )
+    elif not use_signal_filter:
+        print(
+            "  ⚠️ Collecting all stops without OSM geofence (Overpass unavailable)",
+            flush=True,
+        )
 
     if not stops:
-        print("⚠️ No stops returned from TfL API.")
+        print("⚠️ No stops to process (check OSM geofence or TfL API).")
         return
 
     print(f"🔎 Processing {len(stops)} stops (target: 4,000+)...", flush=True)
@@ -238,6 +258,7 @@ async def run_global_collection(stop_limit: int | None = None):
                     disruptions,
                     osm_crossings=osm_crossings,
                     cycle_vehicles=cycle_vehicles,
+                    signal_only=use_signal_filter,
                 )
                 for s in chunk
             ]
@@ -251,8 +272,9 @@ async def run_global_collection(stop_limit: int | None = None):
             print(f"  ✅ First rows inserted successfully ({saved} so far)", flush=True)
         if saved == 0 and i >= BATCH_SIZE * 5:
             print(
-                "  ❌ Zero inserts after 50 stops — check Render logs for "
-                "'Insert failed'. Likely Supabase RLS or wrong SUPABASE_KEY.",
+                "  ❌ Zero inserts after 50 stops — check: Supabase service_role key, "
+                "RLS disabled, or OSM geofence (OSM signals: "
+                f"{len(osm_crossings or [])}).",
                 flush=True,
             )
         if i > 0 and (i // BATCH_SIZE) % 10 == 0:

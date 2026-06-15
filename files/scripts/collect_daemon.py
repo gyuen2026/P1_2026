@@ -50,7 +50,7 @@ async def run_one_cycle(limit: int | None = None) -> dict:
     vehicles = await load_bus_positions_for_cycle()
     log.info("Buses tracked: %s", len(vehicles))
 
-    result = await run_global_collection(stop_limit=limit)
+    result = await run_global_collection(stop_limit=limit, smoke=bool(limit))
     return result or {"saved": 0, "skipped": 0}
 
 

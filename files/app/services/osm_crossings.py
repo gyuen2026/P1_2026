@@ -19,7 +19,10 @@ from app.services.signal_prediction import (
     _haversine_km,
 )
 
-OVERPASS_URL = "https://overpass-api.de/api/interpreter"
+OVERPASS_ENDPOINTS = [
+    "https://overpass-api.de/api/interpreter",
+    "https://overpass.kumi.systems/api/interpreter",
+]
 CACHE_PATH = Path(__file__).resolve().parent.parent / "data" / "osm_crossings.json"
 CACHE_TTL_SEC = 7 * 24 * 3600  # refresh weekly
 SIGNAL_MATCH_RADIUS_M = 120
@@ -60,10 +63,32 @@ def _save_disk_cache(crossings: list[dict]) -> None:
 
 
 async def fetch_crossings_from_overpass() -> list[dict]:
-    async with httpx.AsyncClient(timeout=120) as client:
-        res = await client.post(OVERPASS_URL, data={"data": _overpass_query()})
-        res.raise_for_status()
-        data = res.json()
+    query = _overpass_query().strip()
+    headers = {
+        "User-Agent": "LondonRunner/2.1 (signal collection)",
+        "Accept": "application/json",
+    }
+    last_err: Exception | None = None
+    data: dict = {}
+
+    async with httpx.AsyncClient(timeout=120, follow_redirects=True) as client:
+        for base_url in OVERPASS_ENDPOINTS:
+            try:
+                res = await client.post(
+                    base_url,
+                    data={"data": query},
+                    headers={**headers, "Content-Type": "application/x-www-form-urlencoded"},
+                )
+                if res.status_code == 406:
+                    res = await client.get(base_url, params={"data": query}, headers=headers)
+                res.raise_for_status()
+                data = res.json()
+                break
+            except Exception as exc:
+                last_err = exc
+                continue
+        else:
+            raise last_err or RuntimeError("All Overpass endpoints failed")
 
     crossings: list[dict] = []
     for el in data.get("elements") or []:
@@ -81,6 +106,26 @@ async def fetch_crossings_from_overpass() -> list[dict]:
             "crossing": tags.get("crossing"),
         })
     return crossings
+
+
+def filter_stops_at_signals(
+    stops: list[dict],
+    crossings: list[dict],
+    limit: int | None = None,
+) -> list[dict]:
+    """Keep stops within SIGNAL_MATCH_RADIUS_M of an OSM traffic signal."""
+    from app.services.signal_prediction import extract_stop_coords, is_valid_london_coord
+
+    matched: list[dict] = []
+    for stop in stops:
+        lat, lon = extract_stop_coords(stop)
+        if not is_valid_london_coord(lat, lon):
+            continue
+        if is_near_traffic_signal(lat, lon, crossings):
+            matched.append(stop)
+            if limit and len(matched) >= limit:
+                break
+    return matched
 
 
 async def ensure_crossings_loaded(force_refresh: bool = False) -> list[dict]:
@@ -121,6 +166,7 @@ async def ensure_crossings_loaded(force_refresh: bool = False) -> list[dict]:
 
     _crossings_cache = []
     _cache_loaded_at = time.time()
+    print("  ⚠️ OSM crossings unavailable — signal geofence disabled for this cycle", flush=True)
     return _crossings_cache
 
 
