@@ -2,6 +2,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 import asyncio
 
+from app.api.geocode import router as geocode_router
 from app.api.routes import router as routes_router
 from app.api.sessions import router as sessions_router
 from app.api.signals import router as signals_router
@@ -20,6 +21,7 @@ app.add_middleware(
 app.include_router(routes_router)
 app.include_router(sessions_router)
 app.include_router(signals_router)
+app.include_router(geocode_router)
 
 
 @app.on_event("startup")
