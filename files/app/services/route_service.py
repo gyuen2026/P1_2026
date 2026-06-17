@@ -66,7 +66,10 @@ def _assign_route_rankings(routes: list[dict]) -> list[dict]:
         return routes
 
     fastest = min(routes, key=lambda r: r["estimated_duration_min"])
-    greenest = min(routes, key=lambda r: (r["signal_stops"], -r["green_wave_score"]))
+    greenest = min(
+        routes,
+        key=lambda r: (r.get("ped_signals_on_path", r["signal_stops"]), -r["green_wave_score"]),
+    )
     straightest = min(routes, key=lambda r: (r["turns"], r["distance_km"]))
 
     for i, route in enumerate(routes):
@@ -89,9 +92,11 @@ def _assign_route_rankings(routes: list[dict]) -> list[dict]:
             route["name"] = f"Option {i + 1}"
             route["badge"] = f"#{i + 1}"
 
+        ped = route.get("ped_signals_on_path", 0)
         route["description"] = (
-            f"{route['turns']} turns · {route['green_wave_score']}% green · "
-            f"~{route['signal_stops']} signal stops · "
+            f"{route['turns']} turns · {ped} ped signals · "
+            f"{route['green_wave_score']}% green · "
+            f"~{route['signal_stops']} red waits · "
             f"{route['signal_wait_total_sec']}s wait"
         )
     return routes
@@ -205,6 +210,7 @@ async def _score_waypoints(
         "distance_km": distance_km or target_km,
         "estimated_duration_min": round(est_duration, 1),
         "signal_stops": signal_stats["expected_red_stops"],
+        "ped_signals_on_path": signal_stats.get("ped_signals_on_path", 0),
         "signal_wait_total_sec": signal_stats["total_wait_sec"],
         "score": score,
         "turns": turns,

@@ -206,3 +206,38 @@ def osm_confidence_boost(lat: float, lon: float, crossings: list[dict] | None = 
     if d <= SIGNAL_MATCH_RADIUS_M:
         return 0.05
     return 0.0
+
+
+def signals_along_path(
+    waypoints: list[dict],
+    crossings: list[dict] | None = None,
+    path_buffer_m: float = 40,
+) -> list[dict]:
+    """
+    Count distinct OSM pedestrian traffic signals within path_buffer_m of the route.
+    More realistic than bus-stop proxy alone (e.g. SE16 → Victoria).
+    """
+    if crossings is None:
+        crossings = _crossings_cache or []
+    if not waypoints or not crossings:
+        return []
+
+    step = max(1, len(waypoints) // 100)
+    samples = waypoints[::step]
+    if waypoints[-1] not in samples:
+        samples = [*samples, waypoints[-1]]
+
+    matched: list[dict] = []
+    seen: set = set()
+    for c in crossings:
+        cid = c.get("id")
+        if cid in seen:
+            continue
+        min_m = min(
+            _haversine_km(c["lat"], c["lon"], wp["lat"], wp["lon"]) * 1000
+            for wp in samples
+        )
+        if min_m <= path_buffer_m:
+            seen.add(cid)
+            matched.append({**c, "distance_m": round(min_m, 1)})
+    return matched

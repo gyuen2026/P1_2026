@@ -195,10 +195,13 @@ async def calc_route_red_probability(
 
     반환:
       expected_red_stops: 예상 빨간불 멈춤 횟수
+      ped_signals_on_path: OSM 보행 신호등 개수 (경로 45m 이내)
       total_wait_sec: 예상 총 대기 시간(초)
       red_probability: 전체 경로 빨간불 조우 확률 (0~1)
       green_wave_score: 초록불 연속 확률 점수 (0~100)
     """
+    from app.services.osm_crossings import ensure_crossings_loaded, signals_along_path
+
     if depart_time is None:
         depart_time = get_london_now()
     elif depart_time.tzinfo is None:
@@ -207,67 +210,84 @@ async def calc_route_red_probability(
     hour = depart_time.astimezone(get_london_now().tzinfo).hour
     time_weight = get_time_weight(hour)
 
-    # 경로 위 버스 정류장 = 신호등 위치 프록시
+    crossings = await ensure_crossings_loaded()
+    osm_signals = signals_along_path(waypoints, crossings, path_buffer_m=45)
+    osm_count = len(osm_signals)
+
+    # 경로 위 버스 정류장 = 신호 사이클 추정 프록시
     stops = (await get_stops_near_path(waypoints))[:6]
 
-    if not stops:
-        # 정류장 없으면 기본값
+    path_sample = waypoints[:: max(1, len(waypoints) // 40)] or waypoints
+    red_stops = 0
+    total_wait = 0.0
+    green_probs: list[float] = []
+    signal_data: dict = {}
+
+    if stops:
+        async def _score_stop(stop: dict) -> tuple[float, float, dict]:
+            dist_to_stop = min(
+                _haversine_km(wp["lat"], wp["lon"], stop["lat"], stop["lon"])
+                for wp in path_sample
+            )
+            arrival_sec = dist_to_stop * pace_min_per_km * 60
+            signal_data = await get_signal_wait_estimate(stop["id"])
+            cycle = signal_data["cycle_sec"] * time_weight
+            wait = signal_data["estimated_wait_sec"] * time_weight
+            green_prob = calc_green_probability(arrival_sec, cycle)
+            return green_prob, wait, signal_data
+
+        stop_results = await asyncio.gather(*[_score_stop(s) for s in stops])
+
+        for green_prob, wait, sig in stop_results:
+            signal_data = sig
+            green_probs.append(green_prob)
+            if green_prob < 0.5:
+                red_stops += 1
+                total_wait += wait
+
+    if osm_count > 0 and not stops:
+        # 버스 정류장 없을 때 OSM 보행 신호등으로 추정 (SE16→Victoria 등)
+        red_rate = min(0.55, 0.32 * time_weight)
+        red_stops = max(1, round(osm_count * red_rate))
+        total_wait = red_stops * 28
+        avg_green = 1.0 - (red_stops / osm_count)
+        green_probs = [avg_green] * min(osm_count, 6)
+    elif osm_count > len(stops) and red_stops == 0:
+        # 버스 프록시는 전부 초록인데 OSM상 교차로가 많으면 보정
+        extra = osm_count - len(stops)
+        supplemental = max(1, round(extra * 0.22 * time_weight))
+        red_stops = supplemental
+        total_wait += supplemental * 25
+        if green_probs:
+            green_probs = [max(0.4, p - 0.12) for p in green_probs]
+
+    if green_probs:
+        avg_green = sum(green_probs) / len(green_probs)
+    elif osm_count > 0:
+        avg_green = max(0.45, 1.0 - red_stops / osm_count)
+    elif stops:
+        avg_green = 0.7
+    else:
         return {
             "expected_red_stops": 0,
+            "ped_signals_on_path": 0,
             "total_wait_sec": 0,
             "red_probability": 0.3,
             "green_wave_score": 70,
             "stop_count": 0,
+            "confidence": 0.1,
         }
-
-    path_sample = waypoints[:: max(1, len(waypoints) // 40)] or waypoints
-
-    async def _score_stop(stop: dict) -> tuple[float, float, dict]:
-        dist_to_stop = min(
-            _haversine_km(wp["lat"], wp["lon"], stop["lat"], stop["lon"])
-            for wp in path_sample
-        )
-        arrival_sec = dist_to_stop * pace_min_per_km * 60
-        signal_data = await get_signal_wait_estimate(stop["id"])
-        cycle = signal_data["cycle_sec"] * time_weight
-        wait = signal_data["estimated_wait_sec"] * time_weight
-        green_prob = calc_green_probability(arrival_sec, cycle)
-        return green_prob, wait, signal_data
-
-    stop_results = await asyncio.gather(*[_score_stop(s) for s in stops])
-
-    red_stops = 0
-    total_wait = 0.0
-    green_probs = []
-    signal_data: dict = {}
-
-    for green_prob, wait, sig in stop_results:
-        signal_data = sig
-        green_probs.append(green_prob)
-        if green_prob < 0.5:
-            red_stops += 1
-            total_wait += wait
-
-    # 전체 경로 초록불 연속 확률
-    if green_probs:
-        avg_green = sum(green_probs) / len(green_probs)
-        # 모든 신호에서 초록불일 확률 (곱)
-        all_green = 1.0
-        for p in green_probs:
-            all_green *= p
-    else:
-        avg_green = 0.7
-        all_green = 0.7
 
     green_wave_score = round(avg_green * 100, 1)
 
     return {
         "expected_red_stops": red_stops,
+        "ped_signals_on_path": osm_count,
         "total_wait_sec": round(total_wait),
         "red_probability": round(1 - avg_green, 2),
         "green_wave_score": green_wave_score,
-        "stop_count": len(stops),
-        "confidence": signal_data.get("confidence", 0.1),
+        "stop_count": max(len(stops), osm_count),
+        "confidence": signal_data.get("confidence", 0.15 if osm_count else 0.1),
     }
 
 
