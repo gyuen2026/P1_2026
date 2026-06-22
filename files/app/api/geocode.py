@@ -197,24 +197,41 @@ def _in_london(lat: float, lon: float) -> bool:
     return min_lat <= lat <= max_lat and min_lon <= lon <= max_lon
 
 
+def _brand_token(raw: str) -> str | None:
+    """gail's victoria → gail for chain POI fan-out."""
+    cleaned = re.sub(r"[^a-zA-Z0-9']", " ", raw.lower()).strip()
+    if len(cleaned) < 2:
+        return None
+    token = cleaned.split()[0].replace("'", "")
+    return token if len(token) >= 3 else None
+
+
+def _name_matches_brand(name: str, token: str) -> bool:
+    n = name.lower()
+    t = token.lower()
+    return t in n or f"{t}'s" in n
+
+
 async def _photon_search(
     query: str,
     *,
     near_lat: float | None = None,
     near_lon: float | None = None,
     limit: int = 15,
+    use_bbox: bool = True,
 ) -> list[dict]:
     """Komoot Photon — free OSM geocoder, typically 200–500 ms."""
     bias_lat = near_lat if near_lat is not None else LONDON_CENTER[0]
     bias_lon = near_lon if near_lon is not None else LONDON_CENTER[1]
-    params = {
+    params: dict = {
         "q": query,
         "limit": min(limit, 25),
         "lat": bias_lat,
         "lon": bias_lon,
         "lang": "en",
-        "bbox": ",".join(str(v) for v in LONDON_BBOX),
     }
+    if use_bbox:
+        params["bbox"] = ",".join(str(v) for v in LONDON_BBOX)
     async with httpx.AsyncClient(timeout=4, headers=HEADERS) as client:
         res = await client.get(f"{PHOTON}/api/", params=params)
     if res.status_code != 200:
@@ -357,21 +374,73 @@ async def _google_places_search(
     return results
 
 
+async def _brand_chain_search(
+    raw: str,
+    *,
+    sort_lat: float,
+    sort_lon: float,
+    cap: int,
+) -> list[dict]:
+    """Fan-out brand queries so all Gail's etc. appear in one fast response."""
+    token = _brand_token(raw)
+    if not token:
+        return []
+
+    queries = list(dict.fromkeys([
+        raw,
+        f"{token}'s london",
+        f"{token} london",
+        token,
+    ]))
+    batches = await asyncio.gather(
+        *[
+            _photon_search(q, near_lat=sort_lat, near_lon=sort_lon, limit=25, use_bbox=True)
+            for q in queries[:3]
+        ],
+        *[
+            _photon_search(q, near_lat=sort_lat, near_lon=sort_lon, limit=25, use_bbox=False)
+            for q in queries[3:4]
+        ],
+        return_exceptions=True,
+    )
+    merged: list[dict] = []
+    for batch in batches:
+        if isinstance(batch, list):
+            merged.extend(batch)
+
+    brand_hits = [p for p in merged if _name_matches_brand(p["name"], token)]
+    if brand_hits:
+        merged = brand_hits + [p for p in merged if p not in brand_hits]
+
+    return _sort_places(_dedupe_places(merged))[:cap]
+
+
 async def _free_fast_search(
+    raw: str,
     search_q: str,
     *,
     sort_lat: float,
     sort_lon: float,
     cap: int,
 ) -> tuple[list[dict], str]:
-    """Photon first (~0.3 s); Nominatim only if Photon is sparse."""
+    """Photon fan-out for chains; Nominatim only when sparse."""
+    token = _brand_token(raw)
+    if token:
+        brand = await _brand_chain_search(raw, sort_lat=sort_lat, sort_lon=sort_lon, cap=cap)
+        if len(brand) >= 3:
+            return brand, "photon+brand"
+
     photon = await _photon_search(
         search_q,
         near_lat=sort_lat,
         near_lon=sort_lon,
         limit=cap,
     )
-    if len(photon) >= min(3, cap):
+    if token:
+        extra_brand = await _brand_chain_search(raw, sort_lat=sort_lat, sort_lon=sort_lon, cap=cap)
+        photon = _dedupe_places(extra_brand + photon)
+
+    if len(photon) >= min(5, cap):
         return _sort_places(photon)[:cap], "photon"
 
     nominatim_task = asyncio.create_task(
@@ -428,6 +497,7 @@ async def search_places(
             return {"results": results, "provider": "google_places"}
 
     results, provider = await _free_fast_search(
+        raw,
         search_q,
         sort_lat=sort_lat,
         sort_lon=sort_lon,
