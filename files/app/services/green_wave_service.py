@@ -31,7 +31,7 @@ async def _fetch_route_candidates(
     start_lon: float,
     end_lat: float,
     end_lon: float,
-    max_routes: int = 5,
+    max_routes: int = 3,
 ) -> list[tuple[list[dict], float | None]]:
     journey_data = await tfl_service.get_journey_options(start_lat, start_lon, end_lat, end_lon)
     if not journey_data or not journey_data.get("journeys"):
@@ -49,11 +49,11 @@ async def _fetch_route_candidates(
         duration = float(journey["duration"]) if journey.get("duration") is not None else None
         raw.append((waypoints, duration))
 
-    if len(raw) < max_routes:
+    if len(raw) < 2:
         extras = await _generate_via_alternatives(
             start_lat, start_lon, end_lat, end_lon,
             existing_sigs=seen_sigs,
-            max_routes=max_routes - len(raw),
+            max_routes=max(0, max_routes - len(raw)),
         )
         raw.extend(extras)
 
@@ -68,7 +68,7 @@ async def optimize_pace_for_green(
     """
     Find pace (min/km) that arrives within available_min while maximising green_wave_score.
     """
-    slim = _simplify_waypoints(waypoints, max_points=80)
+    slim = _simplify_waypoints(waypoints, max_points=50)
     distance_km = path_distance_km(slim)
     if distance_km < 0.1:
         stats = await calc_route_red_probability(slim, 5.5, depart_time)
@@ -81,7 +81,7 @@ async def optimize_pace_for_green(
     best_stats = await calc_route_red_probability(slim, best_pace, depart_time)
     best_green = best_stats["green_wave_score"]
 
-    for delta in (-1.0, -0.6, -0.3, 0.0, 0.3, 0.6, 1.0):
+    for delta in (-0.6, 0.0, 0.6):
         pace = round(baseline + delta, 2)
         if pace < 3.8 or pace > 9.0:
             continue
@@ -154,7 +154,7 @@ async def recommend_green_commute(
         wps, _dur = item
         if len(wps) < 2:
             return None
-        slim = _simplify_waypoints(wps, max_points=80)
+        slim = _simplify_waypoints(wps, max_points=50)
         pace, stats = await optimize_pace_for_green(slim, now, available_min)
         distance_km = path_distance_km(slim)
         duration_min = round(distance_km * pace, 1)
@@ -188,7 +188,7 @@ async def recommend_green_commute(
         }
 
     scored = await asyncio.gather(*[_score_commute(c) for c in candidates])
-    routes = _assign_green_commute_rankings([r for r in scored if r])[:5]
+    routes = _assign_green_commute_rankings([r for r in scored if r])[:3]
 
     return {
         "mode": "green_commute",

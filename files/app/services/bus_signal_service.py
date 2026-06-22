@@ -215,7 +215,7 @@ async def calc_route_red_probability(
     osm_count = len(osm_signals)
 
     # 경로 위 버스 정류장 = 신호 사이클 추정 프록시
-    stops = (await get_stops_near_path(waypoints))[:6]
+    stops = (await get_stops_near_path(waypoints))[:4]
 
     path_sample = waypoints[:: max(1, len(waypoints) // 40)] or waypoints
     red_stops = 0
