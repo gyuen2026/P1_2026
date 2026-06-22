@@ -10,7 +10,7 @@ import httpx
 import math
 from datetime import datetime
 from app.core.config import settings
-from app.services.signal_prediction import get_london_now
+from app.services.signal_prediction import get_london_now, london_hour_and_dow
 
 TFL_BASE = "https://api.tfl.gov.uk"
 
@@ -208,6 +208,7 @@ async def calc_route_red_probability(
         depart_time = depart_time.replace(tzinfo=get_london_now().tzinfo)
 
     hour = depart_time.astimezone(get_london_now().tzinfo).hour
+    hour_i, dow_i = london_hour_and_dow(depart_time)
     time_weight = get_time_weight(hour)
 
     crossings = await ensure_crossings_loaded()
@@ -222,6 +223,8 @@ async def calc_route_red_probability(
     total_wait = 0.0
     green_probs: list[float] = []
     signal_data: dict = {}
+    learned_stops = 0
+    realtime_stops = 0
 
     if stops:
         async def _score_stop(stop: dict) -> tuple[float, float, dict]:
@@ -230,16 +233,23 @@ async def calc_route_red_probability(
                 for wp in path_sample
             )
             arrival_sec = dist_to_stop * pace_min_per_km * 60
-            signal_data = await get_signal_wait_estimate(stop["id"])
-            cycle = signal_data["cycle_sec"] * time_weight
-            wait = signal_data["estimated_wait_sec"] * time_weight
+            sig = await get_signal_estimate_with_learning(stop["id"], hour_i, dow_i)
+            cycle = sig["cycle_sec"] * time_weight
+            wait = sig["estimated_wait_sec"] * time_weight
             green_prob = calc_green_probability(arrival_sec, cycle)
-            return green_prob, wait, signal_data
+            if sig.get("source") == "learned":
+                conf = float(sig.get("confidence") or 0)
+                green_prob = min(1.0, green_prob + 0.06 * conf)
+            return green_prob, wait, sig
 
         stop_results = await asyncio.gather(*[_score_stop(s) for s in stops])
 
         for green_prob, wait, sig in stop_results:
             signal_data = sig
+            if sig.get("source") == "learned":
+                learned_stops += 1
+            else:
+                realtime_stops += 1
             green_probs.append(green_prob)
             if green_prob < 0.5:
                 red_stops += 1
@@ -276,6 +286,9 @@ async def calc_route_red_probability(
             "green_wave_score": 70,
             "stop_count": 0,
             "confidence": 0.1,
+            "supabase_learned_stops": 0,
+            "supabase_realtime_stops": 0,
+            "signal_data_source": "default",
         }
 
     green_wave_score = round(avg_green * 100, 1)
@@ -288,6 +301,14 @@ async def calc_route_red_probability(
         "green_wave_score": green_wave_score,
         "stop_count": max(len(stops), osm_count),
         "confidence": signal_data.get("confidence", 0.15 if osm_count else 0.1),
+        "supabase_learned_stops": learned_stops,
+        "supabase_realtime_stops": realtime_stops,
+        "signal_data_source": (
+            "supabase+realtime" if learned_stops and realtime_stops
+            else "supabase" if learned_stops
+            else "realtime" if realtime_stops
+            else "osm_estimate"
+        ),
     }
 
 
