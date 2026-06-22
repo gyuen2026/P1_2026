@@ -1,22 +1,28 @@
-"""Address search + reverse geocode — Nominatim + Overpass POI (Gail's etc.)."""
+"""Fast free geocode — Photon (primary) + optional Google if API key set."""
 from __future__ import annotations
 
 import asyncio
 import math
 import re
+import time
+from collections import OrderedDict
 
 import httpx
 from fastapi import APIRouter, HTTPException
 
 router = APIRouter(prefix="/geocode", tags=["geocode"])
 
+PHOTON = "https://photon.komoot.io"
 NOMINATIM = "https://nominatim.openstreetmap.org"
-OVERPASS = "https://overpass-api.de/api/interpreter"
 HEADERS = {"User-Agent": "LondonRunner/1.0 (running coach; contact@londonrunner.local)"}
-LONDON_VIEWBOX = "-0.25,51.56,0.05,51.46"
-LONDON_BBOX = (51.46, -0.25, 51.56, 0.05)  # south, west, north, east
+LONDON_CENTER = (51.5074, -0.1278)
+LONDON_BBOX = (-0.25, 51.46, 0.05, 51.56)  # min_lon, min_lat, max_lon, max_lat
 
-# Area hints for "gail's victoria" style queries
+# In-memory cache — repeated searches feel instant (~0 ms).
+_CACHE: OrderedDict[str, tuple[float, list[dict], str]] = OrderedDict()
+_CACHE_TTL_S = 300
+_CACHE_MAX = 256
+
 AREA_HINTS: dict[str, tuple[float, float]] = {
     "victoria station": (51.4952, -0.1441),
     "victoria": (51.4952, -0.1441),
@@ -63,68 +69,52 @@ def _is_house_number_only(value: str) -> bool:
     return bool(re.fullmatch(r"[\d\s\-]+", value.strip()))
 
 
-def _extract_brand_and_area(q: str) -> tuple[str, float | None, float | None]:
+def _area_bias(q: str) -> tuple[float | None, float | None]:
     lower = q.lower().strip()
+    for area, (lat, lon) in sorted(AREA_HINTS.items(), key=lambda x: -len(x[0])):
+        if area in lower:
+            return lat, lon
+    return None, None
+
+
+def _search_query(raw: str) -> tuple[str, float | None, float | None]:
+    """Strip matched area from query so Photon ranks nearby POIs first."""
+    lower = raw.lower().strip()
     area_lat: float | None = None
     area_lon: float | None = None
-    brand = lower
+    query = raw.strip()
 
     for area, (lat, lon) in sorted(AREA_HINTS.items(), key=lambda x: -len(x[0])):
         if area in lower:
-            brand = lower.replace(area, "").strip(" ,")
+            query = re.sub(re.escape(area), "", lower, flags=re.I).strip(" ,")
             area_lat, area_lon = lat, lon
             break
 
-    brand = re.sub(r"\b(london|uk|united kingdom)\b", "", brand, flags=re.I).strip(" ,")
-    return brand, area_lat, area_lon
+    query = re.sub(r"\b(london|uk|united kingdom)\b", "", query, flags=re.I).strip(" ,")
+    if not query:
+        query = raw.strip()
+    if "london" not in query.lower():
+        query = f"{query}, London, UK"
+    return query, area_lat, area_lon
 
 
-def _brand_keyword(brand: str) -> str | None:
-    """gail's → gail for Overpass name~ regex."""
-    cleaned = re.sub(r"[^a-zA-Z0-9']", " ", brand).strip()
-    if len(cleaned) < 2:
+def _cache_get(key: str) -> tuple[list[dict], str] | None:
+    row = _CACHE.get(key)
+    if not row:
         return None
-    token = cleaned.split()[0].replace("'", "")
-    return token[:14] if len(token) >= 3 else None
+    ts, results, provider = row
+    if time.monotonic() - ts > _CACHE_TTL_S:
+        _CACHE.pop(key, None)
+        return None
+    _CACHE.move_to_end(key)
+    return results, provider
 
 
-def _build_address_from_tags(tags: dict) -> str:
-    parts: list[str] = []
-    name = tags.get("name")
-    if name:
-        parts.append(name)
-    street_bits = []
-    if tags.get("addr:housenumber"):
-        street_bits.append(str(tags["addr:housenumber"]))
-    if tags.get("addr:street"):
-        street_bits.append(str(tags["addr:street"]))
-    if street_bits:
-        parts.append(" ".join(street_bits))
-    if tags.get("addr:suburb"):
-        parts.append(str(tags["addr:suburb"]))
-    elif tags.get("addr:neighbourhood"):
-        parts.append(str(tags["addr:neighbourhood"]))
-    if tags.get("addr:postcode"):
-        parts.append(str(tags["addr:postcode"]))
-    parts.append("London, United Kingdom")
-    return ", ".join(dict.fromkeys(p for p in parts if p))
-
-
-def _title_from_nominatim(item: dict) -> str:
-    name = (item.get("name") or "").strip()
-    addr = item.get("address") or {}
-    if name and not _is_house_number_only(name):
-        return name
-    if addr.get("amenity"):
-        return str(addr["amenity"]).replace("_", " ").title()
-    if addr.get("shop"):
-        return str(addr["shop"]).replace("_", " ").title()
-    road = addr.get("road", "")
-    num = addr.get("house_number", "")
-    if road:
-        return f"{num} {road}".strip() if num else road
-    display = item.get("display_name", "")
-    return display.split(",")[0].strip() if display else "Location"
+def _cache_set(key: str, results: list[dict], provider: str) -> None:
+    _CACHE[key] = (time.monotonic(), results, provider)
+    _CACHE.move_to_end(key)
+    while len(_CACHE) > _CACHE_MAX:
+        _CACHE.popitem(last=False)
 
 
 def _place_dict(
@@ -162,60 +152,92 @@ def _dedupe_places(places: list[dict], precision: int = 4) -> list[dict]:
     return out
 
 
-async def _overpass_poi_search(
-    keyword: str,
+def _sort_places(places: list[dict]) -> list[dict]:
+    return sorted(
+        places,
+        key=lambda r: r["distance_m"] if r["distance_m"] is not None else 999999,
+    )
+
+
+def _photon_label(props: dict) -> str:
+    parts: list[str] = []
+    name = (props.get("name") or "").strip()
+    if name:
+        parts.append(name)
+    street_bits = []
+    if props.get("housenumber"):
+        street_bits.append(str(props["housenumber"]))
+    if props.get("street"):
+        street_bits.append(str(props["street"]))
+    if street_bits:
+        parts.append(" ".join(street_bits))
+    for key in ("district", "locality", "city", "postcode", "state", "country"):
+        val = props.get(key)
+        if val and val not in parts:
+            parts.append(str(val))
+    return ", ".join(dict.fromkeys(p for p in parts if p))
+
+
+def _photon_title(props: dict) -> str:
+    name = (props.get("name") or "").strip()
+    if name and not _is_house_number_only(name):
+        return name
+    if props.get("osm_value"):
+        return str(props["osm_value"]).replace("_", " ").title()
+    street = props.get("street") or ""
+    num = props.get("housenumber") or ""
+    if street:
+        return f"{num} {street}".strip() if num else street
+    city = props.get("city") or props.get("district") or "Location"
+    return str(city)
+
+
+def _in_london(lat: float, lon: float) -> bool:
+    min_lon, min_lat, max_lon, max_lat = LONDON_BBOX
+    return min_lat <= lat <= max_lat and min_lon <= lon <= max_lon
+
+
+async def _photon_search(
+    query: str,
     *,
-    limit: int = 50,
-    area_lat: float | None = None,
-    area_lon: float | None = None,
-    area_only: bool = False,
     near_lat: float | None = None,
     near_lon: float | None = None,
+    limit: int = 15,
 ) -> list[dict]:
-    if area_only and area_lat is not None and area_lon is not None:
-        d_lat, d_lon = 0.022, 0.035
-        south, north = area_lat - d_lat, area_lat + d_lat
-        west, east = area_lon - d_lon, area_lon + d_lon
-    else:
-        south, west, north, east = LONDON_BBOX
-
-    # Case-insensitive partial name match (Gail, Gail's Bakery, etc.)
-    query = f"""
-    [out:json][timeout:30];
-    (
-      nwr["name"~"{keyword}",i]({south},{west},{north},{east});
-    );
-    out center {min(limit, 60)};
-    """
-    async with httpx.AsyncClient(timeout=35, headers=HEADERS) as client:
-        res = await client.post(OVERPASS, data={"data": query})
+    """Komoot Photon — free OSM geocoder, typically 200–500 ms."""
+    bias_lat = near_lat if near_lat is not None else LONDON_CENTER[0]
+    bias_lon = near_lon if near_lon is not None else LONDON_CENTER[1]
+    params = {
+        "q": query,
+        "limit": min(limit, 25),
+        "lat": bias_lat,
+        "lon": bias_lon,
+        "lang": "en",
+        "bbox": ",".join(str(v) for v in LONDON_BBOX),
+    }
+    async with httpx.AsyncClient(timeout=4, headers=HEADERS) as client:
+        res = await client.get(f"{PHOTON}/api/", params=params)
     if res.status_code != 200:
         return []
 
-    elements = res.json().get("elements") or []
     results: list[dict] = []
-    sort_lat = area_lat or near_lat
-    sort_lon = area_lon or near_lon
-
-    for el in elements:
-        tags = el.get("tags") or {}
-        poi_name = tags.get("name")
-        if not poi_name:
+    for feat in res.json().get("features") or []:
+        coords = (feat.get("geometry") or {}).get("coordinates") or []
+        if len(coords) < 2:
             continue
-        lat = el.get("lat") or (el.get("center") or {}).get("lat")
-        lon = el.get("lon") or (el.get("center") or {}).get("lon")
-        if lat is None or lon is None:
+        lon, lat = float(coords[0]), float(coords[1])
+        if not _in_london(lat, lon):
             continue
-        label = _build_address_from_tags(tags)
+        props = feat.get("properties") or {}
         results.append(
             _place_dict(
-                lat=float(lat),
-                lon=float(lon),
-                label=label,
-                name=poi_name,
-                category=tags.get("amenity") or tags.get("shop") or "poi",
-                near_lat=sort_lat,
-                near_lon=sort_lon,
+                lat=lat,
+                lon=lon,
+                label=_photon_label(props),
+                name=_photon_title(props),
+                category=props.get("osm_value") or props.get("type") or "poi",
+                near_lat=near_lat,
+                near_lon=near_lon,
             )
         )
     return results
@@ -224,21 +246,20 @@ async def _overpass_poi_search(
 async def _nominatim_search(
     query: str,
     *,
-    limit: int = 15,
+    limit: int = 8,
     near_lat: float | None = None,
     near_lon: float | None = None,
-    viewbox: str = LONDON_VIEWBOX,
 ) -> list[dict]:
     params = {
         "q": query,
         "format": "json",
         "limit": limit,
-        "viewbox": viewbox,
+        "viewbox": "-0.25,51.56,0.05,51.46",
         "bounded": "1",
         "addressdetails": "1",
         "dedupe": "1",
     }
-    async with httpx.AsyncClient(timeout=15, headers=HEADERS) as client:
+    async with httpx.AsyncClient(timeout=3, headers=HEADERS) as client:
         res = await client.get(f"{NOMINATIM}/search", params=params)
     if res.status_code != 200:
         return []
@@ -248,18 +269,128 @@ async def _nominatim_search(
         lat = float(item["lat"])
         lon = float(item["lon"])
         display = item.get("display_name", "")
+        name = (item.get("name") or "").strip()
+        if not name or _is_house_number_only(name):
+            addr = item.get("address") or {}
+            name = addr.get("road") or display.split(",")[0].strip()
         results.append(
             _place_dict(
                 lat=lat,
                 lon=lon,
                 label=display,
-                name=_title_from_nominatim(item),
-                category=item.get("type") or item.get("class") or "",
+                name=name,
+                category=item.get("type") or "",
                 near_lat=near_lat,
                 near_lon=near_lon,
             )
         )
     return results
+
+
+def _google_api_key() -> str:
+    from app.core.config import settings
+
+    return (settings.GOOGLE_MAPS_API_KEY or "").strip()
+
+
+async def _google_places_search(
+    query: str,
+    *,
+    near_lat: float | None = None,
+    near_lon: float | None = None,
+    limit: int = 15,
+) -> list[dict]:
+    key = _google_api_key()
+    if not key:
+        return []
+
+    bias_lat = near_lat if near_lat is not None else LONDON_CENTER[0]
+    bias_lon = near_lon if near_lon is not None else LONDON_CENTER[1]
+    text_query = query if "london" in query.lower() else f"{query}, London, UK"
+    body = {
+        "textQuery": text_query,
+        "maxResultCount": min(limit, 20),
+        "languageCode": "en",
+        "regionCode": "GB",
+        "locationBias": {
+            "circle": {
+                "center": {"latitude": bias_lat, "longitude": bias_lon},
+                "radius": 25000.0,
+            }
+        },
+    }
+    headers = {
+        **HEADERS,
+        "Content-Type": "application/json",
+        "X-Goog-Api-Key": key,
+        "X-Goog-FieldMask": (
+            "places.displayName,places.formattedAddress,places.location,places.primaryType"
+        ),
+    }
+    async with httpx.AsyncClient(timeout=5, headers=headers) as client:
+        res = await client.post(
+            "https://places.googleapis.com/v1/places:searchText",
+            json=body,
+        )
+    if res.status_code != 200:
+        return []
+
+    results: list[dict] = []
+    for place in res.json().get("places") or []:
+        loc = place.get("location") or {}
+        lat, lon = loc.get("latitude"), loc.get("longitude")
+        if lat is None or lon is None:
+            continue
+        name = (place.get("displayName") or {}).get("text") or "Location"
+        label = place.get("formattedAddress") or name
+        results.append(
+            _place_dict(
+                lat=float(lat),
+                lon=float(lon),
+                label=label,
+                name=name,
+                category=place.get("primaryType") or "google_places",
+                near_lat=near_lat,
+                near_lon=near_lon,
+            )
+        )
+    return results
+
+
+async def _free_fast_search(
+    search_q: str,
+    *,
+    sort_lat: float,
+    sort_lon: float,
+    cap: int,
+) -> tuple[list[dict], str]:
+    """Photon first (~0.3 s); Nominatim only if Photon is sparse."""
+    photon = await _photon_search(
+        search_q,
+        near_lat=sort_lat,
+        near_lon=sort_lon,
+        limit=cap,
+    )
+    if len(photon) >= min(3, cap):
+        return _sort_places(photon)[:cap], "photon"
+
+    nominatim_task = asyncio.create_task(
+        _nominatim_search(
+            search_q,
+            limit=8,
+            near_lat=sort_lat,
+            near_lon=sort_lon,
+        )
+    )
+    try:
+        extra = await asyncio.wait_for(nominatim_task, timeout=2.0)
+    except (asyncio.TimeoutError, Exception):
+        nominatim_task.cancel()
+        extra = []
+
+    merged = _dedupe_places(photon + extra)
+    provider = "photon+nominatim" if extra else "photon"
+    return _sort_places(merged)[:cap], provider
 
 
 @router.get("/search")
@@ -273,62 +404,58 @@ async def search_places(
         return {"results": []}
 
     raw = q.strip()
-    brand, area_lat, area_lon = _extract_brand_and_area(raw)
-    keyword = _brand_keyword(brand)
-    sort_lat = area_lat or near_lat
-    sort_lon = area_lon or near_lon
+    search_q, area_lat, area_lon = _search_query(raw)
+    sort_lat = area_lat or near_lat or LONDON_CENTER[0]
+    sort_lon = area_lon or near_lon or LONDON_CENTER[1]
     cap = min(limit, 40)
 
-    tasks: list = []
-    if keyword:
-        tasks.append(
-            _overpass_poi_search(
-                keyword,
-                limit=50,
-                area_lat=area_lat,
-                area_lon=area_lon,
-                area_only=area_lat is not None,
-                near_lat=sort_lat,
-                near_lon=sort_lon,
-            )
-        )
+    cache_key = f"{raw.lower()}|{round(sort_lat, 3)}|{round(sort_lon, 3)}|{cap}"
+    cached = _cache_get(cache_key)
+    if cached:
+        results, provider = cached
+        return {"results": results, "provider": provider, "cached": True}
 
-    nominatim_q = raw if "london" in raw.lower() else f"{raw}, London, UK"
-    tasks.append(
-        _nominatim_search(
-            nominatim_q,
-            limit=15,
+    if _google_api_key():
+        google = await _google_places_search(
+            search_q,
             near_lat=sort_lat,
             near_lon=sort_lon,
+            limit=cap,
         )
+        if google:
+            results = _sort_places(google)[:cap]
+            _cache_set(cache_key, results, "google_places")
+            return {"results": results, "provider": "google_places"}
+
+    results, provider = await _free_fast_search(
+        search_q,
+        sort_lat=sort_lat,
+        sort_lon=sort_lon,
+        cap=cap,
     )
-
-    batches = await asyncio.gather(*tasks, return_exceptions=True)
-    merged: list[dict] = []
-    for batch in batches:
-        if isinstance(batch, list):
-            merged.extend(batch)
-
-    merged = _dedupe_places(merged)
-
-    if sort_lat is not None and sort_lon is not None:
-        merged.sort(key=lambda r: r["distance_m"] if r["distance_m"] is not None else 999999)
-
-    return {"results": merged[:cap]}
+    _cache_set(cache_key, results, provider)
+    return {"results": results, "provider": provider}
 
 
 @router.get("/reverse")
 async def reverse_geocode(lat: float, lon: float):
+    params = {"lat": lat, "lon": lon, "lang": "en"}
+    async with httpx.AsyncClient(timeout=3, headers=HEADERS) as client:
+        res = await client.get(f"{PHOTON}/reverse", params=params)
+    if res.status_code == 200:
+        feats = res.json().get("features") or []
+        if feats:
+            props = feats[0].get("properties") or {}
+            label = _photon_label(props)
+            name = _photon_title(props)
+            return {"lat": lat, "lon": lon, "label": label, "name": name}
+
     params = {"lat": lat, "lon": lon, "format": "json", "addressdetails": "1"}
-    async with httpx.AsyncClient(timeout=15, headers=HEADERS) as client:
+    async with httpx.AsyncClient(timeout=5, headers=HEADERS) as client:
         res = await client.get(f"{NOMINATIM}/reverse", params=params)
     if res.status_code != 200:
         raise HTTPException(status_code=502, detail="Reverse geocoding unavailable")
     item = res.json()
     display = item.get("display_name", f"{lat:.5f}, {lon:.5f}")
-    return {
-        "lat": lat,
-        "lon": lon,
-        "label": display,
-        "name": _title_from_nominatim(item),
-    }
+    name = (item.get("name") or display.split(",")[0]).strip()
+    return {"lat": lat, "lon": lon, "label": display, "name": name}

@@ -30,6 +30,19 @@ def calculate_turns(waypoints: list[dict], angle_threshold: float = 28.0) -> int
     return turns
 
 
+def _signal_wait_tier(expected_red_stops: int) -> int:
+    """Bucket red-light waits so 99 vs 100 never beats 40 vs 100 meaningfully."""
+    if expected_red_stops <= 3:
+        return 0
+    if expected_red_stops <= 8:
+        return 1
+    if expected_red_stops <= 15:
+        return 2
+    if expected_red_stops <= 25:
+        return 3
+    return 4
+
+
 def compute_runner_score(
     *,
     turns: int,
@@ -54,12 +67,12 @@ def _assign_route_rankings(routes: list[dict]) -> list[dict]:
     """Sort by score and attach rank + descriptive names."""
     routes.sort(
         key=lambda r: (
-            r["score"],
-            -r["signal_stops"],
+            _signal_wait_tier(r["signal_stops"]),
+            -r["score"],
+            r["signal_stops"],
             -r["green_wave_score"],
-            -r["turns"],
+            r["turns"],
         ),
-        reverse=True,
     )
 
     if not routes:
@@ -95,8 +108,9 @@ def _assign_route_rankings(routes: list[dict]) -> list[dict]:
         ped = route.get("ped_signals_on_path", 0)
         route["description"] = (
             f"{route['turns']} turns · {ped} ped signals · "
+            f"Tier {_signal_wait_tier(route['signal_stops']) + 1} waits · "
             f"{route['green_wave_score']}% green · "
-            f"~{route['signal_stops']} red waits · "
+            f"~{route['signal_stops']} red · "
             f"{route['signal_wait_total_sec']}s wait"
         )
     return routes
@@ -412,7 +426,8 @@ def generate_voice_instruction(
             f"Turn {reroute_bearing} in {distance_m} meters to detour and rejoin your route."
         )
     else:
-        messages.append("Your route is clear. Continue on your current path.")
+        if not messages:
+            messages.append("Your route is clear. Continue on your current path.")
 
     return {
         "voice_instruction": " ".join(messages),

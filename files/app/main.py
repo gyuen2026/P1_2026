@@ -67,6 +67,32 @@ async def root():
     }
 
 
+@app.get("/routes/green-commute")
+async def green_commute_routes(
+    start_lat: float,
+    start_lon: float,
+    end_lat: float,
+    end_lon: float,
+    arrive_hour: int = 9,
+    arrive_minute: int = 0,
+    commute_type: str = "work",
+):
+    """
+    #1 accuracy mode: home/office commute, arrive by time, pace tuned for green signals.
+    """
+    from app.services.green_wave_service import recommend_green_commute
+
+    return await recommend_green_commute(
+        start_lat,
+        start_lon,
+        end_lat,
+        end_lon,
+        arrive_hour,
+        arrive_minute,
+        commute_type=commute_type,
+    )
+
+
 @app.get("/routes/recommend")
 async def get_routes(
     start_lat: float,

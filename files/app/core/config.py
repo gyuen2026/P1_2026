@@ -7,6 +7,8 @@ class Settings(BaseSettings):
     SUPABASE_KEY: str
     APP_ENV: str = "development"
 
+    GOOGLE_MAPS_API_KEY: str = ""
+
     class Config:
         env_file = ".env"
 
