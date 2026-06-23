@@ -27,10 +27,15 @@ app.include_router(geocode_router)
 @app.on_event("startup")
 async def startup():
     from app.services.osm_crossings import ensure_crossings_loaded
-    # Background collector: runs every 90 min, parallel with user API requests.
-    # For 30-day 24/7 collection, also run scripts/start_month_collector.sh locally.
-    asyncio.create_task(signal_collector.run_scheduler(interval_minutes=90))
+
     asyncio.create_task(ensure_crossings_loaded())
+
+    async def _delayed_collector():
+        # Let user-facing APIs respond first; avoid 90-min collect blocking cold GO.
+        await asyncio.sleep(20 * 60)
+        await signal_collector.run_scheduler(interval_minutes=90)
+
+    asyncio.create_task(_delayed_collector())
 
 
 @app.get("/collector/accuracy")
@@ -76,9 +81,11 @@ async def green_commute_routes(
     arrive_hour: int = 9,
     arrive_minute: int = 0,
     commute_type: str = "work",
+    fast: int = 1,
 ):
     """
     #1 accuracy mode: home/office commute, arrive by time, pace tuned for green signals.
+    fast=1 (default): OSM-only scoring, typically <30s on Render.
     """
     from app.services.green_wave_service import recommend_green_commute
 
@@ -90,6 +97,7 @@ async def green_commute_routes(
         arrive_hour,
         arrive_minute,
         commute_type=commute_type,
+        fast=bool(fast),
     )
 
 

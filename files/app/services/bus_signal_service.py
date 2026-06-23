@@ -189,6 +189,8 @@ async def calc_route_red_probability(
     waypoints: list[dict],
     pace_min_per_km: float,
     depart_time: datetime | None = None,
+    *,
+    fast: bool = False,
 ) -> dict:
     """
     경로 전체에서 빨간불을 만날 예상 횟수와 확률 계산
@@ -214,6 +216,38 @@ async def calc_route_red_probability(
     crossings = await ensure_crossings_loaded()
     osm_signals = signals_along_path(waypoints, crossings, path_buffer_m=45)
     osm_count = len(osm_signals)
+
+    # Fast path: OSM geofence only — no per-stop TfL API (Render timeout fix).
+    if fast:
+        if osm_count == 0:
+            return {
+                "expected_red_stops": 1,
+                "ped_signals_on_path": 0,
+                "total_wait_sec": 25,
+                "red_probability": 0.35,
+                "green_wave_score": 65.0,
+                "stop_count": 0,
+                "confidence": 0.12,
+                "supabase_learned_stops": 0,
+                "supabase_realtime_stops": 0,
+                "signal_data_source": "osm_estimate",
+            }
+        red_rate = min(0.52, 0.28 * time_weight)
+        red_stops = max(1, round(osm_count * red_rate))
+        total_wait = red_stops * 26
+        avg_green = max(0.42, 1.0 - red_stops / osm_count)
+        return {
+            "expected_red_stops": red_stops,
+            "ped_signals_on_path": osm_count,
+            "total_wait_sec": total_wait,
+            "red_probability": round(1 - avg_green, 2),
+            "green_wave_score": round(avg_green * 100, 1),
+            "stop_count": osm_count,
+            "confidence": 0.2,
+            "supabase_learned_stops": 0,
+            "supabase_realtime_stops": 0,
+            "signal_data_source": "osm_fast",
+        }
 
     # 경로 위 버스 정류장 = 신호 사이클 추정 프록시
     stops = (await get_stops_near_path(waypoints))[:4]

@@ -3,6 +3,8 @@ Green Wave Commute — 3 variables only (#1 signal accuracy).
 
 Rank 1: max green (~100%) · arrive on time
 Ranks 2–5: green targets 95 / 89 / 83 / 77 %
+
+fast=True (default): OSM-only scoring, no per-stop TfL — sub-30s on Render.
 """
 from __future__ import annotations
 
@@ -18,10 +20,13 @@ from app.services.route_service import (
     _simplify_waypoints,
     path_distance_km,
 )
+from app.services.signal_collector import get_collection_status
 from app.services.signal_prediction import get_london_now
 
 RANK_GREEN_TARGETS = [100, 95, 89, 83, 77]
 MAX_ROUTES = 5
+_FAST_PACE_DELTAS = (-0.4, 0.0, 0.35)
+_FULL_PACE_DELTAS = (-0.9, -0.5, -0.2, 0.0, 0.3, 0.6)
 
 
 async def _fetch_route_candidates(
@@ -30,6 +35,8 @@ async def _fetch_route_candidates(
     end_lat: float,
     end_lon: float,
     max_routes: int = MAX_ROUTES,
+    *,
+    fast: bool = True,
 ) -> list[tuple[list[dict], float | None]]:
     journey_data = await tfl_service.get_journey_options(start_lat, start_lon, end_lat, end_lon)
     if not journey_data or not journey_data.get("journeys"):
@@ -49,7 +56,7 @@ async def _fetch_route_candidates(
         if len(raw) >= max_routes:
             break
 
-    if len(raw) < max_routes:
+    if not fast and len(raw) < max_routes:
         extras = await _generate_via_alternatives(
             start_lat, start_lon, end_lat, end_lon,
             existing_sigs=seen_sigs,
@@ -60,73 +67,34 @@ async def _fetch_route_candidates(
     return raw[:max_routes]
 
 
-async def optimize_pace_for_green(
-    waypoints: list[dict],
+async def _score_once(
+    slim: list[dict],
     depart_time: datetime,
     available_min: float,
+    *,
+    fast: bool,
 ) -> tuple[float, dict]:
-    """Maximise green % while arriving within available_min (rank #1)."""
-    slim = _simplify_waypoints(waypoints, max_points=50)
     distance_km = path_distance_km(slim)
     if distance_km < 0.1:
-        stats = await calc_route_red_probability(slim, 5.5, depart_time)
+        stats = await calc_route_red_probability(slim, 5.5, depart_time, fast=fast)
         return 5.5, stats
 
     baseline = available_min / distance_km
     baseline = max(4.0, min(8.5, baseline))
-
     best_pace = baseline
-    best_stats = await calc_route_red_probability(slim, best_pace, depart_time)
+    best_stats = await calc_route_red_probability(slim, best_pace, depart_time, fast=fast)
     best_green = best_stats["green_wave_score"]
 
-    for delta in (-0.9, -0.5, -0.2, 0.0, 0.3, 0.6):
+    for delta in (_FAST_PACE_DELTAS if fast else _FULL_PACE_DELTAS):
         pace = round(baseline + delta, 2)
         if pace < 3.5 or pace > 9.5:
             continue
         if distance_km * pace > available_min + 1.5:
             continue
-        stats = await calc_route_red_probability(slim, pace, depart_time)
+        stats = await calc_route_red_probability(slim, pace, depart_time, fast=fast)
         green = stats["green_wave_score"]
-        if green > best_green or (
-            green == best_green and stats["expected_red_stops"] < best_stats["expected_red_stops"]
-        ):
+        if green > best_green:
             best_green = green
-            best_pace = pace
-            best_stats = stats
-
-    return best_pace, best_stats
-
-
-async def optimize_pace_for_target_green(
-    waypoints: list[dict],
-    depart_time: datetime,
-    available_min: float,
-    target_green: float,
-) -> tuple[float, dict]:
-    """Tune pace to hit a green % band (ranks 2–5)."""
-    slim = _simplify_waypoints(waypoints, max_points=50)
-    distance_km = path_distance_km(slim)
-    if distance_km < 0.1:
-        stats = await calc_route_red_probability(slim, 5.5, depart_time)
-        return 5.5, stats
-
-    baseline = available_min / distance_km
-    baseline = max(4.0, min(8.5, baseline))
-
-    best_pace = baseline
-    best_stats = await calc_route_red_probability(slim, best_pace, depart_time)
-    best_diff = abs(best_stats["green_wave_score"] - target_green)
-
-    for delta in (-1.2, -0.8, -0.4, 0.0, 0.4, 0.8, 1.2):
-        pace = round(baseline + delta, 2)
-        if pace < 3.5 or pace > 9.5:
-            continue
-        if distance_km * pace > available_min + 1.5:
-            continue
-        stats = await calc_route_red_probability(slim, pace, depart_time)
-        diff = abs(stats["green_wave_score"] - target_green)
-        if diff < best_diff:
-            best_diff = diff
             best_pace = pace
             best_stats = stats
 
@@ -210,7 +178,11 @@ async def recommend_green_commute(
     arrive_minute: int,
     *,
     commute_type: str = "work",
+    fast: bool = True,
 ) -> dict:
+    if get_collection_status().get("running"):
+        fast = True
+
     now = get_london_now()
     arrive = now.replace(hour=arrive_hour, minute=arrive_minute, second=0, microsecond=0)
     if arrive <= now:
@@ -220,87 +192,58 @@ async def recommend_green_commute(
     if available_min < 5:
         return {"routes": [], "error": "Arrival time too soon — pick a later time"}
 
-    candidates = await _fetch_route_candidates(start_lat, start_lon, end_lat, end_lon)
+    candidates = await _fetch_route_candidates(
+        start_lat, start_lon, end_lat, end_lon, fast=fast
+    )
     if not candidates:
         return {"routes": [], "error": "No routes found"}
 
-    async def _max_green(item: tuple[list[dict], float | None], idx: int):
+    async def _score_candidate(item: tuple[list[dict], float | None]):
         wps, _ = item
         if len(wps) < 2:
             return None
-        slim = _simplify_waypoints(wps, max_points=50)
-        pace, stats = await optimize_pace_for_green(slim, now, available_min)
-        return (stats["green_wave_score"], idx, slim, pace, stats)
+        slim = _simplify_waypoints(wps, max_points=40 if fast else 50)
+        pace, stats = await _score_once(slim, now, available_min, fast=fast)
+        return (stats["green_wave_score"], slim, pace, stats)
 
-    max_results = await asyncio.gather(*[_max_green(c, i) for i, c in enumerate(candidates)])
-    valid = [r for r in max_results if r is not None]
+    scored = await asyncio.gather(*[_score_candidate(c) for c in candidates])
+    valid = [r for r in scored if r is not None]
     if not valid:
         return {"routes": [], "error": "Could not score routes"}
 
-    _, _, slim, pace, stats = max(valid, key=lambda r: r[0])
+    valid.sort(key=lambda r: r[0], reverse=True)
+    used_sigs: set[tuple[tuple[float, float], ...]] = set()
     routes: list[dict] = []
-    routes.append(
-        _route_payload(
-            slim=slim,
-            pace=pace,
-            stats=stats,
-            arrive=arrive,
-            commute_type=commute_type,
-            target_green=100,
-        )
-    )
 
-    used_sigs: set[tuple[tuple[float, float], ...]] = {_route_signature(slim)}
-
-    async def _best_alt_for_target(target: float) -> dict | None:
-        best_alt: tuple[list[dict], float, dict] | None = None
-        best_diff = 999.0
-
-        for wps, _ in candidates:
-            if len(wps) < 2:
-                continue
-            slim_alt = _simplify_waypoints(wps, max_points=50)
-            pace_t, stats_t = await optimize_pace_for_target_green(
-                slim_alt, now, available_min, target
-            )
-            diff = abs(stats_t["green_wave_score"] - target)
-            if diff < best_diff:
-                best_diff = diff
-                best_alt = (slim_alt, pace_t, stats_t)
-
-        if not best_alt:
-            return None
-        slim_alt, pace_t, stats_t = best_alt
-        return _route_payload(
-            slim=slim_alt,
-            pace=pace_t,
-            stats=stats_t,
-            arrive=arrive,
-            commute_type=commute_type,
-            target_green=target,
-        )
-
-    alt_payloads = await asyncio.gather(
-        *[_best_alt_for_target(t) for t in RANK_GREEN_TARGETS[1:]]
-    )
-    for payload in alt_payloads:
-        if payload is None:
-            continue
-        sig = _route_signature(payload["waypoints"])
+    for i, target in enumerate(RANK_GREEN_TARGETS):
+        if i >= len(valid):
+            break
+        _, slim, pace, stats = valid[i]
+        sig = _route_signature(slim)
         if sig in used_sigs:
             continue
         used_sigs.add(sig)
-        routes.append(payload)
+        routes.append(
+            _route_payload(
+                slim=slim,
+                pace=pace,
+                stats=stats,
+                arrive=arrive,
+                commute_type=commute_type,
+                target_green=target,
+            )
+        )
 
     routes = _assign_green_commute_rankings(routes[:MAX_ROUTES])
 
     return {
         "mode": "green_commute",
+        "fast": fast,
         "variables": ["route_a_b", "arrive_by_time", "pedestrian_signals"],
         "commute_type": commute_type,
         "arrive_by": arrive.isoformat(),
         "arrive_by_label": arrive.strftime("%H:%M"),
         "minutes_available": round(available_min),
-        "green_tiers": RANK_GREEN_TARGETS,
+        "green_tiers": RANK_GREEN_TARGETS[: len(routes)],
         "routes": routes,
     }
