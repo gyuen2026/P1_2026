@@ -252,8 +252,7 @@ async def recommend_green_commute(
 
     used_sigs: set[tuple[tuple[float, float], ...]] = {_route_signature(slim)}
 
-    # Ranks 2–5 — target 95 / 89 / 83 / 77 on alternate paths
-    for target in RANK_GREEN_TARGETS[1:]:
+    async def _best_alt_for_target(target: float) -> dict | None:
         best_alt: tuple[list[dict], float, dict] | None = None
         best_diff = 999.0
 
@@ -261,31 +260,37 @@ async def recommend_green_commute(
             if len(wps) < 2:
                 continue
             slim_alt = _simplify_waypoints(wps, max_points=50)
-            sig = _route_signature(slim_alt)
             pace_t, stats_t = await optimize_pace_for_target_green(
                 slim_alt, now, available_min, target
             )
             diff = abs(stats_t["green_wave_score"] - target)
-            # Prefer unused physical routes, then closest green band
-            sig_penalty = 0 if sig not in used_sigs else 8
-            score = diff + sig_penalty
-            if score < best_diff:
-                best_diff = score
+            if diff < best_diff:
+                best_diff = diff
                 best_alt = (slim_alt, pace_t, stats_t)
 
-        if best_alt:
-            slim_alt, pace_t, stats_t = best_alt
-            used_sigs.add(_route_signature(slim_alt))
-            routes.append(
-                _route_payload(
-                    slim=slim_alt,
-                    pace=pace_t,
-                    stats=stats_t,
-                    arrive=arrive,
-                    commute_type=commute_type,
-                    target_green=target,
-                )
-            )
+        if not best_alt:
+            return None
+        slim_alt, pace_t, stats_t = best_alt
+        return _route_payload(
+            slim=slim_alt,
+            pace=pace_t,
+            stats=stats_t,
+            arrive=arrive,
+            commute_type=commute_type,
+            target_green=target,
+        )
+
+    alt_payloads = await asyncio.gather(
+        *[_best_alt_for_target(t) for t in RANK_GREEN_TARGETS[1:]]
+    )
+    for payload in alt_payloads:
+        if payload is None:
+            continue
+        sig = _route_signature(payload["waypoints"])
+        if sig in used_sigs:
+            continue
+        used_sigs.add(sig)
+        routes.append(payload)
 
     routes = _assign_green_commute_rankings(routes[:MAX_ROUTES])
 
