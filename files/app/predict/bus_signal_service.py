@@ -10,7 +10,7 @@ import httpx
 import math
 from datetime import datetime
 from app.core.config import settings
-from app.services.signal_prediction import get_london_now, london_hour_and_dow
+from app.predict.signal_prediction import get_london_now, london_hour_and_dow
 
 TFL_BASE = "https://api.tfl.gov.uk"
 
@@ -20,7 +20,7 @@ async def get_stops_near_path(waypoints: list[dict], radius_m: int = 60) -> list
     """
     경로 좌표 근처 버스 정류장 — OSM traffic_signals geofence로 필터 (무료 정확도↑)
     """
-    from app.services.osm_crossings import ensure_crossings_loaded, is_near_traffic_signal
+    from app.ingest.osm_crossings import ensure_crossings_loaded, is_near_traffic_signal
 
     crossings = await ensure_crossings_loaded()
     stops = []
@@ -91,7 +91,7 @@ async def get_signal_wait_estimate(stop_id: str) -> dict:
             if not arrivals or not isinstance(arrivals, list):
                 return _default_signal_estimate()
 
-            from app.services.signal_prediction import calc_delay_detail
+            from app.predict.signal_prediction import calc_delay_detail
 
             detail = calc_delay_detail(arrivals, get_london_now())
             if detail["sample_count"] == 0:
@@ -202,7 +202,7 @@ async def calc_route_red_probability(
       red_probability: 전체 경로 빨간불 조우 확률 (0~1)
       green_wave_score: 초록불 연속 확률 점수 (0~100)
     """
-    from app.services.osm_crossings import ensure_crossings_loaded, signals_along_path
+    from app.ingest.osm_crossings import ensure_crossings_loaded, signals_along_path
 
     if depart_time is None:
         depart_time = get_london_now()
@@ -367,7 +367,7 @@ async def get_signal_estimate_with_learning(
     """
     # 1순위: 학습된 패턴
     try:
-        from app.services.signal_collector import get_learned_pattern
+        from app.ingest.signal_collector import get_learned_pattern
         pattern = await get_learned_pattern(stop_id, hour, dow)
         if pattern and pattern.get("observation_count", 0) >= 3:
             return {

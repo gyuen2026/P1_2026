@@ -1,7 +1,7 @@
 from fastapi import APIRouter, HTTPException
 from app.models.route import RouteRequest, RouteResponse, SessionSaveRequest
-from app.services.route_service import recommend_routes, check_route_integrity
-from app.services.weather_service import get_current_weather, get_weather_summary
+from app.predict.route_service import recommend_routes, check_route_integrity
+from app.predict.weather_service import get_current_weather, get_weather_summary
 
 router = APIRouter(prefix="/routes", tags=["routes"])
 

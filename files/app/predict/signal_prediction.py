@@ -222,7 +222,7 @@ def estimate_delay_confidence(sample_count: int, methods: list[str], bus_count: 
 
 def estimate_system_accuracy() -> dict[str, Any]:
     """Legacy wrapper — delegates to free-tier fusion accuracy doc."""
-    from app.services.fusion_service import estimate_free_tier_accuracy
+    from app.ingest.fusion_service import estimate_free_tier_accuracy
     return estimate_free_tier_accuracy()
 
 

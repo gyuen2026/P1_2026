@@ -1,8 +1,8 @@
 from fastapi import APIRouter
 from pydantic import BaseModel, Field
 
-from app.services.crowd_signal_service import submit_report, get_consensus_near
-from app.services.fusion_service import estimate_free_tier_accuracy
+from app.ingest.crowd_signal_service import submit_report, get_consensus_near
+from app.ingest.fusion_service import estimate_free_tier_accuracy
 
 router = APIRouter(prefix="/signals", tags=["signals"])
 

@@ -6,7 +6,7 @@ import traceback
 import httpx
 
 from app.core.config import settings
-from app.services.signal_prediction import normalize_disruptions
+from app.predict.signal_prediction import normalize_disruptions
 
 TFL_BASE = "https://api.tfl.gov.uk"
 LONDON_CENTER = (51.5074, -0.1278)

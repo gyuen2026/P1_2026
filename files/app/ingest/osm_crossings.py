@@ -11,7 +11,7 @@ from typing import Any
 
 import httpx
 
-from app.services.signal_prediction import (
+from app.predict.signal_prediction import (
     LONDON_LAT_MAX,
     LONDON_LAT_MIN,
     LONDON_LON_MAX,
@@ -114,7 +114,7 @@ def filter_stops_at_signals(
     limit: int | None = None,
 ) -> list[dict]:
     """Keep stops within SIGNAL_MATCH_RADIUS_M of an OSM traffic signal."""
-    from app.services.signal_prediction import extract_stop_coords, is_valid_london_coord
+    from app.predict.signal_prediction import extract_stop_coords, is_valid_london_coord
 
     matched: list[dict] = []
     for stop in stops:

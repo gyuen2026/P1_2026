@@ -15,8 +15,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from app.services.osm_crossings import osm_confidence_boost
-from app.services.signal_prediction import (
+from app.ingest.osm_crossings import osm_confidence_boost
+from app.predict.signal_prediction import (
     disruption_proximity_score,
     get_london_now,
     merge_jamcam_verification,
@@ -233,7 +233,7 @@ async def predict_signal_fused(
     """
     Full free-tier pipeline: fuse G+V+P+N+C+O, optional H on live requests.
     """
-    from app.services.signal_prediction import jamcam_double_check_pedestrian_signal
+    from app.predict.signal_prediction import jamcam_double_check_pedestrian_signal
 
     sources: list[SourceEstimate] = []
 
@@ -282,12 +282,12 @@ async def predict_signal_at_location(
     stop_id: str | None = None,
 ) -> dict[str, Any]:
     """Live free-tier prediction at a GPS point (for /check-status)."""
-    from app.services import tfl_service
-    from app.services.crowd_signal_service import get_consensus_near
-    from app.services.osm_crossings import ensure_crossings_loaded
-    from app.services.signal_collector import get_learned_pattern
-    from app.services.signal_prediction import calc_delay_detail, london_hour_and_dow, get_london_now
-    from app.services.vehicle_signal_service import infer_vehicle_hold, load_bus_positions_for_cycle
+    from app.ingest import tfl_service
+    from app.ingest.crowd_signal_service import get_consensus_near
+    from app.ingest.osm_crossings import ensure_crossings_loaded
+    from app.ingest.signal_collector import get_learned_pattern
+    from app.predict.signal_prediction import calc_delay_detail, london_hour_and_dow, get_london_now
+    from app.ingest.vehicle_signal_service import infer_vehicle_hold, load_bus_positions_for_cycle
 
     now = get_london_now()
     hour, dow = london_hour_and_dow(now)

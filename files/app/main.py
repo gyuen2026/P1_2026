@@ -6,7 +6,8 @@ from app.api.geocode import router as geocode_router
 from app.api.routes import router as routes_router
 from app.api.sessions import router as sessions_router
 from app.api.signals import router as signals_router
-from app.services import route_service, signal_collector
+from app.predict import route_service
+from app.ingest import signal_collector
 
 app = FastAPI(title="London Runner API", version="2.1")
 
@@ -26,7 +27,7 @@ app.include_router(geocode_router)
 
 @app.on_event("startup")
 async def startup():
-    from app.services.osm_crossings import ensure_crossings_loaded
+    from app.ingest.osm_crossings import ensure_crossings_loaded
 
     asyncio.create_task(ensure_crossings_loaded())
 
@@ -41,7 +42,7 @@ async def startup():
 @app.get("/collector/accuracy")
 async def collector_accuracy():
     """Free-tier accuracy tiers (matches paid traffic-API fusion target)."""
-    from app.services.fusion_service import estimate_free_tier_accuracy
+    from app.ingest.fusion_service import estimate_free_tier_accuracy
     return estimate_free_tier_accuracy()
 
 
@@ -87,7 +88,7 @@ async def green_commute_routes(
     #1 accuracy mode: home/office commute, arrive by time, pace tuned for green signals.
     fast=1 (default): OSM-only scoring, typically <30s on Render.
     """
-    from app.services.green_wave_service import recommend_green_commute
+    from app.predict.green_wave_service import recommend_green_commute
 
     return await recommend_green_commute(
         start_lat,

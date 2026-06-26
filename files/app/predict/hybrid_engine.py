@@ -2,8 +2,8 @@
 Hybrid signal probability engine.
 Delegates to unified signal_prediction module (G + H + N → F).
 """
-from app.services.signal_collector import get_learned_pattern
-from app.services.signal_prediction import get_london_now, predict_signal_state
+from app.ingest.signal_collector import get_learned_pattern
+from app.predict.signal_prediction import get_london_now, predict_signal_state
 
 
 async def get_hybrid_signal_probability(

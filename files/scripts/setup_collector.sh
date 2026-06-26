@@ -67,8 +67,8 @@ echo "→ Testing TfL API..."
 python3 <<'PY'
 import asyncio, sys
 sys.path.insert(0, ".")
-from app.services import tfl_service
-from app.services.signal_prediction import calc_delay_detail, get_london_now
+from app.ingest import tfl_service
+from app.predict.signal_prediction import calc_delay_detail, get_london_now
 
 async def main():
     data = await tfl_service.get_all_stops_in_zones()

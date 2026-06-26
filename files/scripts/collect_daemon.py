@@ -45,9 +45,9 @@ log = logging.getLogger("collect_daemon")
 
 
 async def run_one_cycle(limit: int | None = None) -> dict:
-    from app.services.osm_crossings import ensure_crossings_loaded
-    from app.services.vehicle_signal_service import load_bus_positions_for_cycle
-    from app.services.signal_collector import run_global_collection
+    from app.ingest.osm_crossings import ensure_crossings_loaded
+    from app.ingest.vehicle_signal_service import load_bus_positions_for_cycle
+    from app.ingest.signal_collector import run_global_collection
 
     log.info("Preloading free-tier sources (OSM + VehiclePositions)...")
     await ensure_crossings_loaded()

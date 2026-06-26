@@ -9,7 +9,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from app.core.config import settings
-from app.services.signal_prediction import _haversine_km, get_london_now
+from app.predict.signal_prediction import _haversine_km, get_london_now
 
 LONDON = ZoneInfo("Europe/London")
 CONSENSUS_RADIUS_M = 60

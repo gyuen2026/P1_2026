@@ -6,8 +6,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from app.services import tfl_service
-from app.services.signal_prediction import _haversine_km
+from app.ingest import tfl_service
+from app.predict.signal_prediction import _haversine_km
 
 _cycle_vehicles: list[dict] | None = None
 

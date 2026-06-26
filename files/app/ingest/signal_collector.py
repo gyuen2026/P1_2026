@@ -5,15 +5,15 @@ from collections import defaultdict
 from supabase import create_client
 
 from app.core.config import settings
-from app.services import tfl_service
-from app.services.tfl_service import parse_stops_payload
-from app.services.fusion_service import predict_signal_fused
-from app.services.osm_crossings import (
+from app.ingest import tfl_service
+from app.ingest.tfl_service import parse_stops_payload
+from app.ingest.fusion_service import predict_signal_fused
+from app.ingest.osm_crossings import (
     ensure_crossings_loaded,
     filter_stops_at_signals,
     is_near_traffic_signal,
 )
-from app.services.signal_prediction import (
+from app.predict.signal_prediction import (
     build_observation_record,
     calc_delay_detail,
     estimate_delay_confidence,
@@ -22,7 +22,7 @@ from app.services.signal_prediction import (
     is_valid_london_coord,
     london_hour_and_dow,
 )
-from app.services.vehicle_signal_service import infer_vehicle_hold, load_bus_positions_for_cycle
+from app.ingest.vehicle_signal_service import infer_vehicle_hold, load_bus_positions_for_cycle
 
 BATCH_SIZE = 10
 BATCH_DELAY_SEC = 0.5

@@ -12,16 +12,16 @@ import asyncio
 import uuid
 from datetime import datetime, timedelta
 
-from app.services import tfl_service
-from app.services.bus_signal_service import calc_route_red_probability
-from app.services.route_service import (
+from app.ingest import tfl_service
+from app.predict.bus_signal_service import calc_route_red_probability
+from app.predict.route_service import (
     _generate_via_alternatives,
     _route_signature,
     _simplify_waypoints,
     path_distance_km,
 )
-from app.services.signal_collector import get_collection_status
-from app.services.signal_prediction import get_london_now
+from app.ingest.signal_collector import get_collection_status
+from app.predict.signal_prediction import get_london_now
 
 RANK_GREEN_TARGETS = [100, 95, 89, 83, 77]
 MAX_ROUTES = 5
