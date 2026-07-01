@@ -47,6 +47,9 @@ async def check_route_status(
     hr: int = 0,
     pace: float = 0,
     speed_kmh: float = 0,
+    crossing_lat: float | None = None,
+    crossing_lon: float | None = None,
+    crossing_index: int | None = None,
 ):
     """Real-time rerouting and coaching during an active run."""
     return await check_route_integrity(
@@ -55,4 +58,7 @@ async def check_route_status(
         hr=hr,
         pace=pace,
         speed_kmh=speed_kmh if speed_kmh > 0 else None,
+        crossing_lat=crossing_lat,
+        crossing_lon=crossing_lon,
+        crossing_index=crossing_index,
     )

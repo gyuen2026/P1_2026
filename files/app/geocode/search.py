@@ -504,6 +504,14 @@ async def _free_fast_search(
     return _sort_places(merged)[:cap], provider
 
 
+@router.get("/status")
+async def geocode_status():
+    return {
+        "google_places_enabled": bool(_google_api_key()),
+        "photon_enabled": True,
+    }
+
+
 @router.get("/search")
 async def search_places(
     q: str,

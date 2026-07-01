@@ -131,6 +131,7 @@ def _route_payload(
         "target_green_pct": target_green,
         "polyline": [{"lat": w["lat"], "lon": w["lon"]} for w in slim],
         "waypoints": slim,
+        "crossings": stats.get("crossings") or [],
         "description": "",
         "status": "clear",
         "mode": "green_commute",

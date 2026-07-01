@@ -1,5 +1,8 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse, RedirectResponse
+from pathlib import Path
 import asyncio
 
 from app.api.geocode import router as geocode_router
@@ -23,6 +26,21 @@ app.include_router(routes_router)
 app.include_router(sessions_router)
 app.include_router(signals_router)
 app.include_router(geocode_router)
+
+STATIC_WEB = Path(__file__).resolve().parent / "static" / "web"
+
+
+@app.get("/go")
+async def go_poster():
+    """Full-screen QR poster — passersby scan to open the app."""
+    for candidate in (STATIC_WEB / "go.html",):
+        if candidate.is_file():
+            return FileResponse(candidate)
+    return RedirectResponse(url="/app/go.html", status_code=302)
+
+
+if STATIC_WEB.is_dir():
+    app.mount("/app", StaticFiles(directory=str(STATIC_WEB), html=True), name="flutter_web")
 
 
 @app.on_event("startup")
@@ -125,6 +143,9 @@ async def check_status(
     hr: int = 0,
     pace: float = 0,
     speed_kmh: float = 0,
+    crossing_lat: float | None = None,
+    crossing_lon: float | None = None,
+    crossing_index: int | None = None,
 ):
     """
     Real-time coaching: monitors position (J/M), heart rate (K), speed (L),
@@ -136,4 +157,7 @@ async def check_status(
         hr=hr,
         pace=pace,
         speed_kmh=speed_kmh if speed_kmh > 0 else None,
+        crossing_lat=crossing_lat,
+        crossing_lon=crossing_lon,
+        crossing_index=crossing_index,
     )

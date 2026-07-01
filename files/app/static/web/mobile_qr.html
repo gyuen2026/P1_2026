@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="geengreen-public-url" content="https://london-runner-api.onrender.com/app/" />
+  <title>GEENGREEN — Scan & Run</title>
+  <style>
+    body { margin:0; min-height:100vh; background:#000; color:#fff; font-family:-apple-system,sans-serif;
+      display:flex; flex-direction:column; align-items:center; justify-content:center; padding:24px; text-align:center; }
+    h1 { margin:0 0 6px; }
+    .tag { color:#39ff14; font-weight:700; margin-bottom:20px; }
+    #qr-wrap { background:#fff; padding:16px; border-radius:20px; min-height:252px; display:flex; align-items:center; justify-content:center; }
+    #qr { width:220px; height:220px; }
+    a { margin-top:18px; color:#39ff14; font-weight:700; word-break:break-all; text-decoration:none; }
+    p { color:#8e8e93; max-width:340px; line-height:1.5; }
+    .spin { width:36px; height:36px; border:3px solid #333; border-top-color:#39ff14; border-radius:50%; animation:spin .8s linear infinite; }
+    @keyframes spin { to { transform:rotate(360deg); } }
+  </style>
+  <script src="lan_discovery.js"></script>
+</head>
+<body>
+  <h1>GEENGREEN</h1>
+  <div class="tag">QR 스캔 → 바로 런</div>
+  <div id="qr-wrap"><div class="spin" id="loading"></div><img id="qr" alt="QR" hidden /></div>
+  <a id="url" href="#" hidden></a>
+  <p>GPS·위치는 <strong>스캔한 폰</strong>에서 사용됩니다.</p>
+  <script>
+    (async function () {
+      var meta = document.querySelector('meta[name="geengreen-public-url"]');
+      var publicUrl = meta ? meta.getAttribute('content') : '';
+      var url = await window.geengreenResolveMobileUrl({ publicUrl: publicUrl, port: location.port || '8086' });
+      var loading = document.getElementById('loading');
+      var img = document.getElementById('qr');
+      var link = document.getElementById('url');
+      if (!url) { loading.outerHTML = '<p style="color:#ff453a">URL 준비 실패</p>'; return; }
+      loading.hidden = true; img.hidden = false; link.hidden = false;
+      link.textContent = url; link.href = url;
+      img.src = 'https://api.qrserver.com/v1/create-qr-code/?size=440x440&data=' + encodeURIComponent(url);
+    })();
+  </script>
+</body>
+</html>

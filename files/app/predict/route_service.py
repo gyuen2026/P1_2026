@@ -231,6 +231,7 @@ async def _score_waypoints(
         "green_wave_score": signal_stats["green_wave_score"],
         "polyline": [{"lat": w["lat"], "lon": w["lon"]} for w in slim],
         "waypoints": slim,
+        "crossings": signal_stats.get("crossings") or [],
         "description": "",
         "status": "clear" if disrupt_pen < 0.3 else "disrupted",
     }
@@ -439,6 +440,39 @@ def generate_voice_instruction(
     }
 
 
+def _signal_phase_alert(signal: dict, crossing_index: int | None = None) -> dict:
+    """Korean countdown alerts for AR crossing signals."""
+    color = (signal.get("predicted_color") or "GREEN").upper()
+    wait = float(signal.get("estimated_wait_sec") or 30)
+    cycle = float(signal.get("estimated_cycle_sec") or 90)
+    gp = float(signal.get("green_probability") or 0.5)
+    prefix = f"횡단보도 {crossing_index} — " if crossing_index else ""
+
+    if color == "GREEN":
+        sec = max(3, min(99, round(cycle * (1 - gp) * 0.45)))
+        return {
+            "seconds_display": sec,
+            "seconds_until_red": sec,
+            "alert_ko": f"{prefix}{sec}초 뒤에 빨간 불입니다",
+            "phase": "green",
+        }
+    if color == "RED":
+        sec = max(3, min(99, round(wait)))
+        return {
+            "seconds_display": sec,
+            "seconds_until_green": sec,
+            "alert_ko": f"{prefix}{sec}초 뒤에 초록 불입니다",
+            "phase": "red",
+        }
+    sec = max(3, min(15, round(wait * 0.2)))
+    return {
+        "seconds_display": sec,
+        "seconds_until_red": sec,
+        "alert_ko": f"{prefix}{sec}초 뒤에 빨간 불입니다",
+        "phase": "amber",
+    }
+
+
 async def check_route_integrity(
     user_lat: float,
     user_lon: float,
@@ -446,6 +480,9 @@ async def check_route_integrity(
     pace: float = 0,
     speed_kmh: float | None = None,
     route_waypoints: list[dict] | None = None,
+    crossing_lat: float | None = None,
+    crossing_lon: float | None = None,
+    crossing_index: int | None = None,
 ) -> dict:
     """
     Real-time route monitor for /routes/check-status.
@@ -454,7 +491,9 @@ async def check_route_integrity(
     disruptions = await tfl_service.get_road_disruptions()
     effective_speed = speed_kmh if speed_kmh else (60 / pace if pace > 0 else 0)
 
-    signal = await predict_signal_at_location(user_lat, user_lon, include_jamcam=True)
+    pred_lat = crossing_lat if crossing_lat is not None else user_lat
+    pred_lon = crossing_lon if crossing_lon is not None else user_lon
+    signal = await predict_signal_at_location(pred_lat, pred_lon, include_jamcam=True)
 
     result = generate_voice_instruction(
         user_lat=user_lat,
@@ -469,7 +508,10 @@ async def check_route_integrity(
         "predicted_color": signal["predicted_color"],
         "green_probability": signal["green_probability"],
         "confidence": signal["confidence"],
+        "estimated_wait_sec": signal.get("estimated_wait_sec"),
+        "estimated_cycle_sec": signal.get("estimated_cycle_sec"),
         "jamcam_check": signal.get("jamcam_check"),
+        **_signal_phase_alert(signal, crossing_index),
     }
     result["disruptions_nearby"] = len([
         d for d in disruptions

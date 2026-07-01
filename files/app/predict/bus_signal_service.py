@@ -202,7 +202,7 @@ async def calc_route_red_probability(
       red_probability: 전체 경로 빨간불 조우 확률 (0~1)
       green_wave_score: 초록불 연속 확률 점수 (0~100)
     """
-    from app.ingest.osm_crossings import ensure_crossings_loaded, signals_along_path
+    from app.ingest.osm_crossings import ensure_crossings_loaded, signals_along_path, order_crossings_along_path
 
     if depart_time is None:
         depart_time = get_london_now()
@@ -216,11 +216,16 @@ async def calc_route_red_probability(
     crossings = await ensure_crossings_loaded()
     osm_signals = signals_along_path(waypoints, crossings, path_buffer_m=45)
     osm_count = len(osm_signals)
+    ordered_crossings = order_crossings_along_path(waypoints, osm_signals)
+
+    def _with_crossings(payload: dict) -> dict:
+        payload["crossings"] = ordered_crossings
+        return payload
 
     # Fast path: OSM geofence only — no per-stop TfL API (Render timeout fix).
     if fast:
         if osm_count == 0:
-            return {
+            return _with_crossings({
                 "expected_red_stops": 1,
                 "ped_signals_on_path": 0,
                 "total_wait_sec": 25,
@@ -231,12 +236,12 @@ async def calc_route_red_probability(
                 "supabase_learned_stops": 0,
                 "supabase_realtime_stops": 0,
                 "signal_data_source": "osm_estimate",
-            }
+            })
         red_rate = min(0.52, 0.28 * time_weight)
         red_stops = max(1, round(osm_count * red_rate))
         total_wait = red_stops * 26
         avg_green = max(0.42, 1.0 - red_stops / osm_count)
-        return {
+        return _with_crossings({
             "expected_red_stops": red_stops,
             "ped_signals_on_path": osm_count,
             "total_wait_sec": total_wait,
@@ -247,7 +252,7 @@ async def calc_route_red_probability(
             "supabase_learned_stops": 0,
             "supabase_realtime_stops": 0,
             "signal_data_source": "osm_fast",
-        }
+        })
 
     # 경로 위 버스 정류장 = 신호 사이클 추정 프록시
     stops = (await get_stops_near_path(waypoints))[:4]
@@ -312,7 +317,7 @@ async def calc_route_red_probability(
     elif stops:
         avg_green = 0.7
     else:
-        return {
+        return _with_crossings({
             "expected_red_stops": 0,
             "ped_signals_on_path": 0,
             "total_wait_sec": 0,
@@ -323,11 +328,11 @@ async def calc_route_red_probability(
             "supabase_learned_stops": 0,
             "supabase_realtime_stops": 0,
             "signal_data_source": "default",
-        }
+        })
 
     green_wave_score = round(avg_green * 100, 1)
 
-    return {
+    return _with_crossings({
         "expected_red_stops": red_stops,
         "ped_signals_on_path": osm_count,
         "total_wait_sec": round(total_wait),
@@ -343,7 +348,7 @@ async def calc_route_red_probability(
             else "realtime" if realtime_stops
             else "osm_estimate"
         ),
-    }
+    })
 
 
 def _haversine_km(lat1, lon1, lat2, lon2) -> float:

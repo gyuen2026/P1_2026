@@ -241,3 +241,41 @@ def signals_along_path(
             seen.add(cid)
             matched.append({**c, "distance_m": round(min_m, 1)})
     return matched
+
+
+def order_crossings_along_path(
+    waypoints: list[dict],
+    crossings: list[dict],
+) -> list[dict]:
+    """Order OSM crossings by progress along the route polyline."""
+    if not waypoints or not crossings:
+        return []
+
+    scored: list[tuple[int, float, dict]] = []
+    for c in crossings:
+        best_i = 0
+        best_m = float("inf")
+        for i, wp in enumerate(waypoints):
+            d_m = _haversine_km(c["lat"], c["lon"], wp["lat"], wp["lon"]) * 1000
+            if d_m < best_m:
+                best_m = d_m
+                best_i = i
+        scored.append((best_i, best_m, c))
+
+    scored.sort(key=lambda item: (item[0], item[1]))
+    ordered: list[dict] = []
+    for i, (_, _, c) in enumerate(scored):
+        ordered.append({
+            "lat": c["lat"],
+            "lon": c["lon"],
+            "id": c.get("id"),
+            "index": i + 1,
+        })
+    return ordered
+
+
+def crossings_payload(waypoints: list[dict], crossings: list[dict] | None = None) -> list[dict]:
+    """Compact crossing list for API responses."""
+    if crossings is None:
+        crossings = signals_along_path(waypoints, _crossings_cache or [])
+    return order_crossings_along_path(waypoints, crossings)
