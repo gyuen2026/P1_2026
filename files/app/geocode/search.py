@@ -70,6 +70,8 @@ AREA_HINTS: dict[str, tuple[float, float]] = {
     "hampstead": (51.5560, -0.1780),
     "se16": (51.4940, -0.0600),
     "se1": (51.5035, -0.0800),
+    "london bridge": (51.5055, -0.0870),
+    "borough": (51.5045, -0.0910),
     "w1": (51.5140, -0.1440),
     "city of london": (51.5155, -0.0922),
 }
@@ -209,6 +211,22 @@ def _in_london(lat: float, lon: float) -> bool:
 
 _BRAND_STOP = frozenset({"the", "at", "near", "in", "on", "and", "london", "uk"})
 
+# Short retail queries → expanded Photon / Nominatim search terms.
+_BRAND_ALIASES: dict[str, list[str]] = {
+    "m&s": ["marks and spencer", "marks spencer"],
+    "m & s": ["marks and spencer", "marks spencer"],
+    "ms": ["marks and spencer"],
+    "marks": ["marks and spencer"],
+    "pret": ["pret a manger"],
+    "tesco": ["tesco express", "tesco"],
+    "sainsbury": ["sainsburys", "sainsbury's"],
+    "sainsburys": ["sainsbury's"],
+    "waitrose": ["waitrose"],
+    "boots": ["boots pharmacy"],
+    "starbucks": ["starbucks coffee"],
+    "costa": ["costa coffee"],
+}
+
 
 def _brand_token(raw: str) -> str | None:
     cleaned = re.sub(r"[^a-zA-Z0-9']", " ", raw.lower()).strip()
@@ -221,10 +239,42 @@ def _brand_token(raw: str) -> str | None:
     return token if len(token) >= 3 else None
 
 
+def _expand_brand_queries(raw: str) -> list[str]:
+    """Return search variants — e.g. M&S → Marks and Spencer."""
+    base = raw.strip()
+    lower = base.lower()
+    out = [base]
+    if lower in _BRAND_ALIASES:
+        out.extend(_BRAND_ALIASES[lower])
+    compact = re.sub(r"[^a-z0-9]", "", lower)
+    if compact in _BRAND_ALIASES:
+        out.extend(_BRAND_ALIASES[compact])
+    token = _brand_token(base)
+    if token and token in _BRAND_ALIASES:
+        out.extend(_BRAND_ALIASES[token])
+    return list(dict.fromkeys(q for q in out if q.strip()))
+
+
 def _name_matches_brand(name: str, token: str) -> bool:
     n = name.lower()
     t = token.lower()
-    return t in n or f"{t}'s" in n
+    if t in n or f"{t}'s" in n:
+        return True
+    if t == "marks" and ("spencer" in n or "m&s" in n):
+        return True
+    return False
+
+
+def _name_matches_retail_aliases(name: str, raw: str) -> bool:
+    lower = raw.strip().lower()
+    n = name.lower()
+    if lower in ("m&s", "m & s", "ms") or re.sub(r"[^a-z0-9]", "", lower) == "ms":
+        return ("marks" in n and "spencer" in n) or "m&s" in n
+    for alias in _expand_brand_queries(raw)[1:]:
+        words = alias.lower().split()
+        if words and all(w in n for w in words[:2]):
+            return True
+    return False
 
 
 async def _photon_search(
@@ -286,14 +336,17 @@ async def _photon_tiered(
     sort_lat: float,
     sort_lon: float,
     cap: int,
+    tight_local: bool = False,
 ) -> list[dict]:
     """Two-tier bias: local first, broader only when sparse."""
+    local_scale = 0.06 if tight_local else 0.12
+    local_zoom = 17 if tight_local else 16
     local = await _photon_search(
         search_q,
         near_lat=sort_lat,
         near_lon=sort_lon,
-        zoom=16,
-        location_bias_scale=0.12,
+        zoom=local_zoom,
+        location_bias_scale=local_scale,
     )
     if len(local) >= min(5, cap):
         return _sort_places(_dedupe_places(local))[:cap]
@@ -428,38 +481,52 @@ async def _brand_chain_search(
     sort_lat: float,
     sort_lon: float,
     cap: int,
+    tight_local: bool = False,
 ) -> list[dict]:
+    queries = _expand_brand_queries(raw)
     token = _brand_token(raw)
-    if not token:
-        return []
+    if token and f"{token} london" not in queries:
+        queries.append(f"{token} london")
 
-    queries = list(dict.fromkeys([raw, f"{token} london"]))
-    batches = await asyncio.gather(
+    tasks = [
         _photon_search(
-            queries[0],
+            q,
             near_lat=sort_lat,
             near_lon=sort_lon,
-            zoom=16,
-            location_bias_scale=0.12,
-        ),
+            zoom=17 if tight_local else 16,
+            location_bias_scale=0.06 if tight_local else 0.12,
+        )
+        for q in queries[:3]
+    ]
+    tasks.append(
         _photon_search(
-            queries[1],
+            queries[-1],
             near_lat=sort_lat,
             near_lon=sort_lon,
             zoom=13,
             location_bias_scale=0.3,
             use_bbox=False,
-        ),
-        return_exceptions=True,
+        )
     )
+    batches = await asyncio.gather(*tasks, return_exceptions=True)
     merged: list[dict] = []
     for batch in batches:
         if isinstance(batch, list):
             merged.extend(batch)
 
-    brand_hits = [p for p in merged if _name_matches_brand(p["name"], token)]
-    if brand_hits:
-        merged = brand_hits + [p for p in merged if p not in brand_hits]
+    if token:
+        brand_hits = [p for p in merged if _name_matches_brand(p["name"], token)]
+        alias_hits = [
+            p for p in merged
+            if any(_name_matches_brand(p["name"], a.split()[0]) for a in queries[1:])
+        ]
+        preferred = _dedupe_places(brand_hits + alias_hits)
+        if preferred:
+            merged = preferred + [p for p in merged if p not in preferred]
+    elif len(queries) > 1:
+        retail_hits = [p for p in merged if _name_matches_retail_aliases(p["name"], raw)]
+        if retail_hits:
+            merged = retail_hits + [p for p in merged if p not in retail_hits]
 
     return _sort_places(_dedupe_places(merged))[:cap]
 
@@ -471,17 +538,38 @@ async def _free_fast_search(
     sort_lat: float,
     sort_lon: float,
     cap: int,
+    tight_local: bool = False,
 ) -> tuple[list[dict], str]:
+    brand_queries = _expand_brand_queries(raw)
     token = _brand_token(raw)
+
+    if len(brand_queries) > 1 or raw.strip().lower() in _BRAND_ALIASES:
+        brand = await _brand_chain_search(
+            raw,
+            sort_lat=sort_lat,
+            sort_lon=sort_lon,
+            cap=cap,
+            tight_local=tight_local,
+        )
+        if brand:
+            return _sort_places(brand)[:cap], "photon+brand"
+
     photon = await _photon_tiered(
         search_q,
         sort_lat=sort_lat,
         sort_lon=sort_lon,
         cap=cap,
+        tight_local=tight_local,
     )
 
     if token and len(photon) < 5:
-        brand = await _brand_chain_search(raw, sort_lat=sort_lat, sort_lon=sort_lon, cap=cap)
+        brand = await _brand_chain_search(
+            raw,
+            sort_lat=sort_lat,
+            sort_lon=sort_lon,
+            cap=cap,
+            tight_local=tight_local,
+        )
         photon = _dedupe_places(brand + photon)
 
     if len(photon) >= min(3, cap):
@@ -527,8 +615,9 @@ async def search_places(
     sort_lat = area_lat or near_lat or LONDON_CENTER[0]
     sort_lon = area_lon or near_lon or LONDON_CENTER[1]
     cap = min(limit, 40)
+    tight_local = near_lat is not None and near_lon is not None
 
-    cache_key = f"{raw.lower()}|{round(sort_lat, 3)}|{round(sort_lon, 3)}|{cap}"
+    cache_key = f"{raw.lower()}|{round(sort_lat, 3)}|{round(sort_lon, 3)}|{cap}|{tight_local}"
     cached = _cache_get(cache_key)
     if cached:
         results, provider = cached
@@ -552,6 +641,7 @@ async def search_places(
         sort_lat=sort_lat,
         sort_lon=sort_lon,
         cap=cap,
+        tight_local=tight_local,
     )
     _cache_set(cache_key, results, provider)
     return {"results": results, "provider": provider}

@@ -1,6 +1,9 @@
 import asyncio
+import hashlib
 import math
+import time
 import uuid
+from datetime import datetime, timezone
 
 from app.ingest import tfl_service
 from app.predict.bus_signal_service import calc_route_red_probability
@@ -440,36 +443,112 @@ def generate_voice_instruction(
     }
 
 
-def _signal_phase_alert(signal: dict, crossing_index: int | None = None) -> dict:
-    """Korean countdown alerts for AR crossing signals."""
-    color = (signal.get("predicted_color") or "GREEN").upper()
-    wait = float(signal.get("estimated_wait_sec") or 30)
-    cycle = float(signal.get("estimated_cycle_sec") or 90)
-    gp = float(signal.get("green_probability") or 0.5)
-    prefix = f"횡단보도 {crossing_index} — " if crossing_index else ""
+_PED_GREEN_RATIO = 0.45
 
-    if color == "GREEN":
-        sec = max(3, min(99, round(cycle * (1 - gp) * 0.45)))
-        return {
-            "seconds_display": sec,
-            "seconds_until_red": sec,
-            "alert_ko": f"{prefix}{sec}초 뒤에 빨간 불입니다",
-            "phase": "green",
-        }
-    if color == "RED":
-        sec = max(3, min(99, round(wait)))
-        return {
-            "seconds_display": sec,
-            "seconds_until_green": sec,
-            "alert_ko": f"{prefix}{sec}초 뒤에 초록 불입니다",
-            "phase": "red",
-        }
-    sec = max(3, min(15, round(wait * 0.2)))
+
+def _crossing_phase_offset(lat: float, lon: float, cycle: float) -> float:
+    """Stable per-crossing offset so each signal has its own cycle position."""
+    key = f"{round(lat, 5)}:{round(lon, 5)}"
+    digest = hashlib.md5(key.encode()).hexdigest()
+    return (int(digest[:8], 16) / 0xFFFFFFFF) * cycle
+
+
+def _jamcam_live_phase(jamcam_check: dict | None) -> str | None:
+    if not jamcam_check or jamcam_check.get("verified") is not True:
+        return None
+    color = (jamcam_check.get("jamcam_color") or "").upper()
+    if color in ("GREEN", "RED", "AMBER", "YELLOW"):
+        return "amber" if color in ("AMBER", "YELLOW") else color.lower()
+    return None
+
+
+def _live_signal_phase(
+    *,
+    lat: float,
+    lon: float,
+    cycle_sec: float,
+    wait_sec: float,
+    jamcam_check: dict | None = None,
+    now_epoch: float | None = None,
+) -> dict:
+    """
+    Time-varying pedestrian phase at a crossing.
+    Countdown advances every second instead of returning a fixed estimate.
+    """
+    cycle = max(45.0, min(150.0, float(cycle_sec or 90)))
+    wait = max(8.0, min(90.0, float(wait_sec or 30)))
+    green_dur = cycle * _PED_GREEN_RATIO
+    red_dur = max(8.0, cycle - green_dur)
+    amber_dur = min(6.0, wait * 0.15)
+
+    now = now_epoch if now_epoch is not None else time.time()
+    offset = _crossing_phase_offset(lat, lon, cycle)
+    pos = (now + offset) % cycle
+
+    jam_phase = _jamcam_live_phase(jamcam_check)
+    if pos < green_dur:
+        phase = "green"
+        sec = green_dur - pos
+        target = "red"
+        label = "빨간 불까지"
+    elif pos < green_dur + amber_dur:
+        phase = "amber"
+        sec = (green_dur + amber_dur) - pos
+        target = "red"
+        label = "빨간 불까지"
+    else:
+        phase = "red"
+        sec = cycle - pos
+        target = "green"
+        label = "초록 불까지"
+
+    if jam_phase == "green" and phase != "green":
+        phase = "green"
+        sec = max(3.0, green_dur * 0.35)
+        target = "red"
+        label = "빨간 불까지"
+    elif jam_phase == "red" and phase == "green":
+        phase = "red"
+        sec = max(3.0, red_dur * 0.4)
+        target = "green"
+        label = "초록 불까지"
+
+    sec_i = max(1, min(99, round(sec)))
+    ends_at = datetime.fromtimestamp(now + sec, tz=timezone.utc).isoformat()
+
     return {
-        "seconds_display": sec,
-        "seconds_until_red": sec,
-        "alert_ko": f"{prefix}{sec}초 뒤에 빨간 불입니다",
-        "phase": "amber",
+        "phase": phase,
+        "seconds_display": sec_i,
+        "seconds_until_red": sec_i if target == "red" else 0,
+        "seconds_until_green": sec_i if target == "green" else 0,
+        "countdown_target": target,
+        "countdown_label_ko": label,
+        "phase_ends_at": ends_at,
+        "cycle_sec": round(cycle, 1),
+    }
+
+
+def _signal_phase_alert(
+    signal: dict,
+    crossing_index: int | None = None,
+    *,
+    lat: float,
+    lon: float,
+) -> dict:
+    """Korean live countdown alerts for AR crossing signals."""
+    live = _live_signal_phase(
+        lat=lat,
+        lon=lon,
+        cycle_sec=float(signal.get("estimated_cycle_sec") or 90),
+        wait_sec=float(signal.get("estimated_wait_sec") or 30),
+        jamcam_check=signal.get("jamcam_check"),
+    )
+    sec = live["seconds_display"]
+    label = live["countdown_label_ko"]
+    prefix = f"횡단보도 {crossing_index} — " if crossing_index else ""
+    return {
+        **live,
+        "alert_ko": f"{prefix}{label} {sec}초",
     }
 
 
@@ -511,7 +590,12 @@ async def check_route_integrity(
         "estimated_wait_sec": signal.get("estimated_wait_sec"),
         "estimated_cycle_sec": signal.get("estimated_cycle_sec"),
         "jamcam_check": signal.get("jamcam_check"),
-        **_signal_phase_alert(signal, crossing_index),
+        **_signal_phase_alert(
+            signal,
+            crossing_index,
+            lat=pred_lat,
+            lon=pred_lon,
+        ),
     }
     result["disruptions_nearby"] = len([
         d for d in disruptions
